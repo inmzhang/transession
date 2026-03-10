@@ -25,19 +25,17 @@ transession --from codex --to claude <SESSION_ID> --no-open
 
 ## Install
 
-After the crate is published on crates.io:
-
 ```bash
 cargo install transession
 ```
 
-Before publication, install directly from GitHub:
+Or install directly from GitHub:
 
 ```bash
 cargo install --git https://github.com/inmzhang/transession.git
 ```
 
-From a local checkout:
+Or from a local checkout:
 
 ```bash
 cargo install --path .
