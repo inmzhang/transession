@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, SecondsFormat, Utc};
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -16,6 +17,12 @@ use crate::ir::{
 pub struct CodexMaterialization {
     pub session_file: PathBuf,
     pub session_index: Option<PathBuf>,
+}
+
+struct ActiveTurn {
+    turn_id: String,
+    last_agent_message: Option<String>,
+    last_timestamp: Option<DateTime<Utc>>,
 }
 
 pub fn load(path: &Path) -> Result<UniversalSession> {
@@ -424,124 +431,90 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         }),
     )?;
 
-    let mut turn_context_payload = Map::new();
-    turn_context_payload.insert(
-        "turn_id".to_string(),
-        Value::String(Uuid::now_v7().to_string()),
-    );
-    turn_context_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
-    turn_context_payload.insert(
-        "current_date".to_string(),
-        extra_string(&session.metadata, "codex_current_date")
-            .unwrap_or_else(|| {
-                created_at
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .into(),
-    );
-    turn_context_payload.insert(
-        "timezone".to_string(),
-        extra_string(&session.metadata, "codex_timezone")
-            .unwrap_or_else(local_timezone_name_or_offset)
-            .into(),
-    );
-    turn_context_payload.insert(
-        "approval_policy".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_approval_policy")
-            .cloned()
-            .unwrap_or_else(|| Value::String("on-request".to_string())),
-    );
-    turn_context_payload.insert(
-        "sandbox_policy".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_sandbox_policy")
-            .cloned()
-            .unwrap_or_else(|| json!({ "type": "workspace-write" })),
-    );
-    turn_context_payload.insert(
-        "model".to_string(),
-        session
-            .metadata
-            .model
-            .clone()
-            .unwrap_or_else(|| "gpt-5".to_string())
-            .into(),
-    );
-    turn_context_payload.insert(
-        "personality".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_personality")
-            .cloned()
-            .unwrap_or_else(|| Value::String("pragmatic".to_string())),
-    );
-    turn_context_payload.insert(
-        "collaboration_mode".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_collaboration_mode")
-            .cloned()
-            .unwrap_or_else(|| json!({ "mode": "default" })),
-    );
-    if let Some(user_instructions) = session.metadata.extra.get("codex_user_instructions") {
-        turn_context_payload.insert("user_instructions".to_string(), user_instructions.clone());
-    }
-
-    write_json_line(
-        &mut file,
-        &json!({
-            "timestamp": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "type": "turn_context",
-            "payload": turn_context_payload,
-        }),
-    )?;
+    let mut active_turn: Option<ActiveTurn> = None;
 
     for event in &session.events {
         match event {
             SessionEvent::Message(message) => {
-                let blocks = message
-                    .blocks
-                    .iter()
-                    .filter_map(|block| {
-                        let text = block.text.clone()?;
-                        let mapped_kind = codex_block_kind(&message.role, &block.kind);
-                        let mut object = Map::new();
-                        object.insert("type".to_string(), Value::String(mapped_kind.to_string()));
-                        object.insert("text".to_string(), Value::String(text));
-                        if let Some(Value::Object(extra)) = &block.data {
-                            object.extend(extra.clone());
-                        }
-                        Some(Value::Object(object))
-                    })
-                    .collect::<Vec<_>>();
+                let timestamp = message.timestamp.unwrap_or(updated_at);
+                let rendered_text = render_message_text(message);
 
-                if blocks.is_empty() {
+                if message.role == "user" {
+                    close_turn(&mut file, &mut active_turn, updated_at)?;
+                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                    write_message_response_item(&mut file, message, updated_at)?;
+                    if let Some(text) = rendered_text {
+                        write_json_line(
+                            &mut file,
+                            &json!({
+                                "timestamp": event_timestamp(message.timestamp, updated_at),
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "user_message",
+                                    "message": text,
+                                    "images": [],
+                                    "local_images": [],
+                                    "text_elements": [],
+                                }
+                            }),
+                        )?;
+                    }
+                    if let Some(turn) = &mut active_turn {
+                        turn.last_timestamp = Some(timestamp);
+                    }
                     continue;
                 }
 
-                write_json_line(
-                    &mut file,
-                    &json!({
-                        "timestamp": event_timestamp(message.timestamp, updated_at),
-                        "type": "response_item",
-                        "payload": {
-                            "type": "message",
-                            "role": message.role,
-                            "content": blocks,
-                        }
-                    }),
-                )?;
+                if message.role != "developer" && active_turn.is_none() {
+                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                }
+
+                if message.role == "assistant"
+                    && let Some(text) = rendered_text.clone()
+                {
+                    write_json_line(
+                        &mut file,
+                        &json!({
+                            "timestamp": event_timestamp(message.timestamp, updated_at),
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_message",
+                                "message": text,
+                                "phase": "commentary",
+                            }
+                        }),
+                    )?;
+                    if let Some(turn) = &mut active_turn {
+                        turn.last_agent_message = rendered_text;
+                    }
+                }
+
+                write_message_response_item(&mut file, message, updated_at)?;
+                if let Some(turn) = &mut active_turn {
+                    turn.last_timestamp = Some(timestamp);
+                }
             }
             SessionEvent::Reasoning(reasoning) => {
+                let timestamp = reasoning.timestamp.unwrap_or(updated_at);
+                if active_turn.is_none() {
+                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                }
+
+                let summary_text = render_reasoning_text(reasoning);
+                if !summary_text.is_empty() {
+                    write_json_line(
+                        &mut file,
+                        &json!({
+                            "timestamp": event_timestamp(reasoning.timestamp, updated_at),
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_reasoning",
+                                "text": summary_text,
+                            }
+                        }),
+                    )?;
+                }
+
                 write_json_line(
                     &mut file,
                     &json!({
@@ -557,8 +530,15 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
+                if let Some(turn) = &mut active_turn {
+                    turn.last_timestamp = Some(timestamp);
+                }
             }
             SessionEvent::ToolCall(call) => {
+                let timestamp = call.timestamp.unwrap_or(updated_at);
+                if active_turn.is_none() {
+                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                }
                 write_json_line(
                     &mut file,
                     &json!({
@@ -573,8 +553,15 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
+                if let Some(turn) = &mut active_turn {
+                    turn.last_timestamp = Some(timestamp);
+                }
             }
             SessionEvent::ToolResult(result) => {
+                let timestamp = result.timestamp.unwrap_or(updated_at);
+                if active_turn.is_none() {
+                    active_turn = Some(start_turn(&mut file, &session.metadata, &cwd, timestamp)?);
+                }
                 write_json_line(
                     &mut file,
                     &json!({
@@ -587,9 +574,14 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
+                if let Some(turn) = &mut active_turn {
+                    turn.last_timestamp = Some(timestamp);
+                }
             }
         }
     }
+
+    close_turn(&mut file, &mut active_turn, updated_at)?;
 
     if let Some(session_index) = &materialization.session_index {
         if let Some(parent) = session_index.parent() {
@@ -610,6 +602,17 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 "thread_name": derive_title(session).unwrap_or_else(|| "Imported session".to_string()),
                 "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             }),
+        )?;
+    }
+
+    if output.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        register_thread_in_sqlite(
+            output,
+            session,
+            &materialization.session_file,
+            &session_id,
+            created_at,
+            updated_at,
         )?;
     }
 
@@ -777,6 +780,210 @@ fn local_timezone_name_or_offset() -> String {
     std::env::var("TZ").unwrap_or_else(|_| Local::now().offset().to_string())
 }
 
+fn start_turn(
+    file: &mut impl Write,
+    metadata: &SessionMetadata,
+    cwd: &Path,
+    timestamp: DateTime<Utc>,
+) -> Result<ActiveTurn> {
+    let turn_id = Uuid::now_v7().to_string();
+    let rendered_timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let collaboration_mode = metadata
+        .extra
+        .get("codex_collaboration_mode")
+        .cloned()
+        .unwrap_or_else(|| json!({ "mode": "default" }));
+    let collaboration_mode_kind = collaboration_mode
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("default");
+
+    write_json_line(
+        file,
+        &json!({
+            "timestamp": rendered_timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id,
+                "model_context_window": 950000,
+                "collaboration_mode_kind": collaboration_mode_kind,
+            }
+        }),
+    )?;
+    write_json_line(
+        file,
+        &json!({
+            "timestamp": rendered_timestamp,
+            "type": "turn_context",
+            "payload": build_turn_context_payload(metadata, cwd, &turn_id, timestamp),
+        }),
+    )?;
+
+    Ok(ActiveTurn {
+        turn_id,
+        last_agent_message: None,
+        last_timestamp: Some(timestamp),
+    })
+}
+
+fn close_turn(
+    file: &mut impl Write,
+    active_turn: &mut Option<ActiveTurn>,
+    fallback: DateTime<Utc>,
+) -> Result<()> {
+    let Some(turn) = active_turn.take() else {
+        return Ok(());
+    };
+
+    write_json_line(
+        file,
+        &json!({
+            "timestamp": event_timestamp(turn.last_timestamp, fallback),
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": turn.turn_id,
+                "last_agent_message": turn.last_agent_message.unwrap_or_default(),
+            }
+        }),
+    )
+}
+
+fn build_turn_context_payload(
+    metadata: &SessionMetadata,
+    cwd: &Path,
+    turn_id: &str,
+    timestamp: DateTime<Utc>,
+) -> Map<String, Value> {
+    let mut turn_context_payload = Map::new();
+    turn_context_payload.insert("turn_id".to_string(), Value::String(turn_id.to_string()));
+    turn_context_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+    turn_context_payload.insert(
+        "current_date".to_string(),
+        extra_string(metadata, "codex_current_date")
+            .unwrap_or_else(|| {
+                timestamp
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .into(),
+    );
+    turn_context_payload.insert(
+        "timezone".to_string(),
+        extra_string(metadata, "codex_timezone")
+            .unwrap_or_else(local_timezone_name_or_offset)
+            .into(),
+    );
+    turn_context_payload.insert(
+        "approval_policy".to_string(),
+        metadata
+            .extra
+            .get("codex_approval_policy")
+            .cloned()
+            .unwrap_or_else(|| Value::String("on-request".to_string())),
+    );
+    turn_context_payload.insert(
+        "sandbox_policy".to_string(),
+        metadata
+            .extra
+            .get("codex_sandbox_policy")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "workspace-write" })),
+    );
+    turn_context_payload.insert(
+        "model".to_string(),
+        metadata
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5".to_string())
+            .into(),
+    );
+    turn_context_payload.insert(
+        "personality".to_string(),
+        metadata
+            .extra
+            .get("codex_personality")
+            .cloned()
+            .unwrap_or_else(|| Value::String("pragmatic".to_string())),
+    );
+    turn_context_payload.insert(
+        "collaboration_mode".to_string(),
+        metadata
+            .extra
+            .get("codex_collaboration_mode")
+            .cloned()
+            .unwrap_or_else(|| json!({ "mode": "default" })),
+    );
+    if let Some(user_instructions) = metadata.extra.get("codex_user_instructions") {
+        turn_context_payload.insert("user_instructions".to_string(), user_instructions.clone());
+    }
+    turn_context_payload
+}
+
+fn write_message_response_item(
+    file: &mut impl Write,
+    message: &MessageEvent,
+    fallback: DateTime<Utc>,
+) -> Result<()> {
+    let blocks = message
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let text = block.text.clone()?;
+            let mapped_kind = codex_block_kind(&message.role, &block.kind);
+            let mut object = Map::new();
+            object.insert("type".to_string(), Value::String(mapped_kind.to_string()));
+            object.insert("text".to_string(), Value::String(text));
+            if let Some(Value::Object(extra)) = &block.data {
+                object.extend(extra.clone());
+            }
+            Some(Value::Object(object))
+        })
+        .collect::<Vec<_>>();
+
+    if blocks.is_empty() {
+        return Ok(());
+    }
+
+    write_json_line(
+        file,
+        &json!({
+            "timestamp": event_timestamp(message.timestamp, fallback),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": message.role,
+                "content": blocks,
+            }
+        }),
+    )
+}
+
+fn render_message_text(message: &MessageEvent) -> Option<String> {
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| block.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn render_reasoning_text(reasoning: &ReasoningEvent) -> String {
+    reasoning
+        .summary
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
     match original_kind {
         "input_text" => "input_text",
@@ -789,6 +996,129 @@ fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
             }
         }
     }
+}
+
+fn register_thread_in_sqlite(
+    codex_root: &Path,
+    session: &UniversalSession,
+    session_file: &Path,
+    session_id: &str,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<()> {
+    let sqlite_path = codex_root.join("state_5.sqlite");
+    if !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    let connection = Connection::open(&sqlite_path)
+        .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    let title = derive_title(session).unwrap_or_else(|| "Imported session".to_string());
+    let first_user_message = first_user_message(session).unwrap_or_else(|| title.clone());
+    let cwd = session
+        .metadata
+        .cwd
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let sandbox_policy = session
+        .metadata
+        .extra
+        .get("codex_sandbox_policy")
+        .map(json_to_string)
+        .unwrap_or_else(|| "{\"type\":\"workspace-write\"}".to_string());
+    let approval_mode = extra_string(&session.metadata, "codex_approval_policy")
+        .unwrap_or_else(|| "on-request".to_string());
+    let model_provider = session
+        .metadata
+        .model
+        .clone()
+        .unwrap_or_else(|| "imported".to_string());
+    let git_branch = session.metadata.git_branch.clone();
+    let has_user_event = session
+        .events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::Message(message) if message.role == "user"))
+        as i64;
+
+    connection
+        .execute(
+            "INSERT INTO threads (
+                id,
+                rollout_path,
+                created_at,
+                updated_at,
+                source,
+                model_provider,
+                cwd,
+                title,
+                sandbox_policy,
+                approval_mode,
+                tokens_used,
+                has_user_event,
+                archived,
+                git_sha,
+                git_branch,
+                git_origin_url,
+                cli_version,
+                first_user_message,
+                agent_nickname,
+                agent_role,
+                memory_mode
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, NULL, ?12, NULL, ?13, ?14, NULL, NULL, 'enabled'
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                rollout_path=excluded.rollout_path,
+                updated_at=excluded.updated_at,
+                source=excluded.source,
+                model_provider=excluded.model_provider,
+                cwd=excluded.cwd,
+                title=excluded.title,
+                sandbox_policy=excluded.sandbox_policy,
+                approval_mode=excluded.approval_mode,
+                has_user_event=excluded.has_user_event,
+                git_branch=excluded.git_branch,
+                cli_version=excluded.cli_version,
+                first_user_message=excluded.first_user_message,
+                memory_mode=excluded.memory_mode",
+            params![
+                session_id,
+                session_file.display().to_string(),
+                created_at.timestamp(),
+                updated_at.timestamp(),
+                "cli",
+                model_provider,
+                cwd,
+                title,
+                sandbox_policy,
+                approval_mode,
+                has_user_event,
+                git_branch,
+                codex_cli_version(&session.metadata),
+                first_user_message,
+            ],
+        )
+        .with_context(|| format!("failed to register thread {} in {}", session_id, sqlite_path.display()))?;
+
+    Ok(())
+}
+
+fn first_user_message(session: &UniversalSession) -> Option<String> {
+    session.events.iter().find_map(|event| {
+        let SessionEvent::Message(message) = event else {
+            return None;
+        };
+        if message.role != "user" {
+            return None;
+        }
+        message
+            .blocks
+            .iter()
+            .filter_map(|block| block.text.as_deref())
+            .map(collapse_whitespace)
+            .find(|text| !text.is_empty())
+    })
 }
 
 fn format_name(format: SessionFormat) -> &'static str {

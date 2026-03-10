@@ -141,6 +141,7 @@ fn quick_convert(cli: Cli) -> Result<()> {
         to,
         &session.metadata.session_id,
         &output,
+        session.metadata.cwd.as_deref(),
         wrote_standalone_jsonl,
         cli.no_open,
     )?;
@@ -260,6 +261,7 @@ fn maybe_open_session(
     format: SessionFormat,
     session_id: &str,
     output_root: &std::path::Path,
+    session_cwd: Option<&std::path::Path>,
     wrote_standalone_jsonl: bool,
     no_open: bool,
 ) -> Result<()> {
@@ -273,7 +275,7 @@ fn maybe_open_session(
         );
     }
 
-    let mut command = resume_command(format, session_id, output_root)?;
+    let mut command = resume_command(format, session_id, output_root, session_cwd)?;
     println!("opening {} session...", format_name(format));
     std::io::stdout()
         .flush()
@@ -300,6 +302,7 @@ fn resume_command(
     format: SessionFormat,
     session_id: &str,
     output_root: &std::path::Path,
+    session_cwd: Option<&std::path::Path>,
 ) -> Result<ProcessCommand> {
     let mut command = match format {
         SessionFormat::Codex => {
@@ -328,6 +331,10 @@ fn resume_command(
             command.env("CLAUDE_HOME", output_root);
         }
         SessionFormat::Ir => {}
+    }
+
+    if let Some(cwd) = session_cwd {
+        command.current_dir(cwd);
     }
 
     Ok(command)

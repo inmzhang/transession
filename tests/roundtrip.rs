@@ -2,10 +2,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+use rusqlite::Connection;
 use tempfile::tempdir;
 use transession::formats::{detect_format, load_session, materialize};
 use transession::ir::{
-    ContentBlock, MessageEvent, SessionEvent, SessionFormat, SourceFormat, UniversalSession,
+    ContentBlock, MessageEvent, ReasoningEvent, SessionEvent, SessionFormat, SourceFormat,
+    UniversalSession,
 };
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -71,6 +73,36 @@ fn detects_and_imports_claude_fixture() {
 fn materializes_canonical_codex_layout() {
     let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
     let temp = tempdir().unwrap();
+    let sqlite = temp.path().join("state_5.sqlite");
+    let connection = Connection::open(&sqlite).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                agent_nickname TEXT,
+                agent_role TEXT,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled'
+            );",
+        )
+        .unwrap();
     let path = materialize(&session, SessionFormat::Codex, temp.path()).unwrap();
 
     assert!(path.exists());
@@ -78,6 +110,143 @@ fn materializes_canonical_codex_layout() {
 
     let index = temp.path().join("session_index.jsonl");
     assert!(index.exists());
+    let registered_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(registered_count, 1);
+}
+
+#[test]
+fn materialized_codex_sessions_include_turn_events() {
+    let temp = tempdir().unwrap();
+    let sqlite = temp.path().join("state_5.sqlite");
+    let connection = Connection::open(&sqlite).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                agent_nickname TEXT,
+                agent_role TEXT,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled'
+            );",
+        )
+        .unwrap();
+
+    let mut session = UniversalSession::new("turn-events".to_string());
+    session.events.push(SessionEvent::Message(MessageEvent {
+        id: None,
+        parent_id: None,
+        role: "developer".to_string(),
+        timestamp: None,
+        blocks: vec![ContentBlock::text(
+            "input_text",
+            "Repository instructions apply.",
+        )],
+        metadata: Default::default(),
+    }));
+    session.events.push(SessionEvent::Message(MessageEvent {
+        id: None,
+        parent_id: None,
+        role: "user".to_string(),
+        timestamp: None,
+        blocks: vec![ContentBlock::text("input_text", "First prompt")],
+        metadata: Default::default(),
+    }));
+    session.events.push(SessionEvent::Reasoning(ReasoningEvent {
+        id: None,
+        parent_id: None,
+        timestamp: None,
+        summary: vec!["Thinking through the task.".to_string()],
+        metadata: Default::default(),
+    }));
+    session.events.push(SessionEvent::Message(MessageEvent {
+        id: None,
+        parent_id: None,
+        role: "assistant".to_string(),
+        timestamp: None,
+        blocks: vec![ContentBlock::text(
+            "output_text",
+            "First answer with context.",
+        )],
+        metadata: Default::default(),
+    }));
+    session.events.push(SessionEvent::Message(MessageEvent {
+        id: None,
+        parent_id: None,
+        role: "user".to_string(),
+        timestamp: None,
+        blocks: vec![ContentBlock::text("input_text", "Second prompt")],
+        metadata: Default::default(),
+    }));
+    session.events.push(SessionEvent::Message(MessageEvent {
+        id: None,
+        parent_id: None,
+        role: "assistant".to_string(),
+        timestamp: None,
+        blocks: vec![ContentBlock::text("output_text", "Second answer.")],
+        metadata: Default::default(),
+    }));
+
+    let path = materialize(&session, SessionFormat::Codex, temp.path()).unwrap();
+    let lines = fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    let type_counts = lines
+        .iter()
+        .filter_map(|value| value.get("type").and_then(|value| value.as_str()))
+        .fold(
+            std::collections::BTreeMap::<String, usize>::new(),
+            |mut acc, value| {
+                *acc.entry(value.to_string()).or_insert(0) += 1;
+                acc
+            },
+        );
+    assert_eq!(type_counts.get("session_meta"), Some(&1));
+    assert_eq!(type_counts.get("turn_context"), Some(&2));
+    assert_eq!(type_counts.get("event_msg"), Some(&9));
+
+    let event_types = lines
+        .iter()
+        .filter(|value| value.get("type").and_then(|value| value.as_str()) == Some("event_msg"))
+        .filter_map(|value| {
+            value
+                .get("payload")
+                .and_then(|value| value.get("type"))
+                .and_then(|value| value.as_str())
+        })
+        .fold(
+            std::collections::BTreeMap::<String, usize>::new(),
+            |mut acc, value| {
+                *acc.entry(value.to_string()).or_insert(0) += 1;
+                acc
+            },
+        );
+    assert_eq!(event_types.get("task_started"), Some(&2));
+    assert_eq!(event_types.get("user_message"), Some(&2));
+    assert_eq!(event_types.get("agent_reasoning"), Some(&1));
+    assert_eq!(event_types.get("agent_message"), Some(&2));
+    assert_eq!(event_types.get("task_complete"), Some(&2));
 }
 
 #[test]
@@ -93,6 +262,12 @@ fn materializes_canonical_claude_layout() {
     let text = fs::read_to_string(path).unwrap();
     assert!(!text.contains("\"type\":\"input_text\""));
     assert!(!text.contains("\"type\":\"output_text\""));
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if let Some(message) = value.get("message") {
+            assert!(message.get("content").unwrap().is_array());
+        }
+    }
 }
 
 #[test]

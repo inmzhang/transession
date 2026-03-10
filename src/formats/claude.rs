@@ -635,14 +635,6 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
         return Value::Null;
     }
 
-    if blocks.len() == 1
-        && claude_block_kind(&blocks[0].kind) == "text"
-        && blocks[0].data.is_none()
-        && let Some(text) = &blocks[0].text
-    {
-        return Value::String(text.clone());
-    }
-
     let encoded = blocks
         .iter()
         .map(|block| {
