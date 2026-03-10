@@ -120,7 +120,7 @@ pub struct MessageEvent {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContentBlock {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]

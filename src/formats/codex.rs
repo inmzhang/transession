@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, SecondsFormat, Utc};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::ir::{
@@ -93,6 +93,20 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
             .extra
             .insert("codex_source".to_string(), source.clone());
     }
+    if let Some(originator) = payload.get("originator") {
+        metadata
+            .extra
+            .insert("codex_originator".to_string(), originator.clone());
+    }
+    if let Some(base_instructions) = payload
+        .get("base_instructions")
+        .and_then(|value| value.get("text"))
+    {
+        metadata.extra.insert(
+            "codex_base_instructions".to_string(),
+            base_instructions.clone(),
+        );
+    }
 }
 
 fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
@@ -119,6 +133,27 @@ fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
             .extra
             .insert("codex_personality".to_string(), personality.clone());
     }
+    copy_if_present(
+        payload,
+        metadata,
+        "approval_policy",
+        "codex_approval_policy",
+    );
+    copy_if_present(payload, metadata, "sandbox_policy", "codex_sandbox_policy");
+    copy_if_present(
+        payload,
+        metadata,
+        "collaboration_mode",
+        "codex_collaboration_mode",
+    );
+    copy_if_present(
+        payload,
+        metadata,
+        "user_instructions",
+        "codex_user_instructions",
+    );
+    copy_if_present(payload, metadata, "timezone", "codex_timezone");
+    copy_if_present(payload, metadata, "current_date", "codex_current_date");
 }
 
 fn import_response_item(events: &mut Vec<SessionEvent>, value: &Value) {
@@ -323,73 +358,169 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
+    let mut session_meta_payload = Map::new();
+    session_meta_payload.insert("id".to_string(), Value::String(session_id.clone()));
+    session_meta_payload.insert(
+        "timestamp".to_string(),
+        Value::String(created_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
+    );
+    session_meta_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+    session_meta_payload.insert(
+        "originator".to_string(),
+        extra_string(&session.metadata, "codex_originator")
+            .unwrap_or_else(|| "transession".to_string())
+            .into(),
+    );
+    session_meta_payload.insert(
+        "cli_version".to_string(),
+        codex_cli_version(&session.metadata).into(),
+    );
+    session_meta_payload.insert(
+        "source".to_string(),
+        session
+            .metadata
+            .extra
+            .get("codex_source")
+            .cloned()
+            .unwrap_or_else(|| Value::String("import".to_string())),
+    );
+    session_meta_payload.insert(
+        "model_provider".to_string(),
+        Value::String(
+            session
+                .metadata
+                .model
+                .clone()
+                .unwrap_or_else(|| "imported".to_string()),
+        ),
+    );
+    session_meta_payload.insert(
+        "base_instructions".to_string(),
+        json!({
+            "text": extra_string(&session.metadata, "codex_base_instructions").unwrap_or_else(|| {
+                format!(
+                    "Imported by transession from {} session {}.",
+                    session
+                        .metadata
+                        .source_format
+                        .map(format_name)
+                        .unwrap_or("unknown"),
+                    session
+                        .metadata
+                        .original_session_id
+                        .clone()
+                        .unwrap_or_else(|| session.metadata.session_id.clone()),
+                )
+            })
+        }),
+    );
+
     write_json_line(
         &mut file,
         &json!({
             "timestamp": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             "type": "session_meta",
-            "payload": {
-                "id": session_id,
-                "timestamp": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "cwd": cwd,
-                "originator": "transession",
-                "cli_version": env!("CARGO_PKG_VERSION"),
-                "source": "import",
-                "model_provider": session.metadata.model.clone().unwrap_or_else(|| "imported".to_string()),
-                "base_instructions": {
-                    "text": format!(
-                        "Imported by transession from {} session {}.",
-                        session
-                            .metadata
-                            .source_format
-                            .map(format_name)
-                            .unwrap_or("unknown"),
-                        session.metadata.original_session_id.clone().unwrap_or_else(|| session.metadata.session_id.clone()),
-                    )
-                }
-            }
+            "payload": session_meta_payload,
         }),
     )?;
+
+    let mut turn_context_payload = Map::new();
+    turn_context_payload.insert(
+        "turn_id".to_string(),
+        Value::String(Uuid::now_v7().to_string()),
+    );
+    turn_context_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+    turn_context_payload.insert(
+        "current_date".to_string(),
+        extra_string(&session.metadata, "codex_current_date")
+            .unwrap_or_else(|| {
+                created_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .into(),
+    );
+    turn_context_payload.insert(
+        "timezone".to_string(),
+        extra_string(&session.metadata, "codex_timezone")
+            .unwrap_or_else(local_timezone_name_or_offset)
+            .into(),
+    );
+    turn_context_payload.insert(
+        "approval_policy".to_string(),
+        session
+            .metadata
+            .extra
+            .get("codex_approval_policy")
+            .cloned()
+            .unwrap_or_else(|| Value::String("on-request".to_string())),
+    );
+    turn_context_payload.insert(
+        "sandbox_policy".to_string(),
+        session
+            .metadata
+            .extra
+            .get("codex_sandbox_policy")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "workspace-write" })),
+    );
+    turn_context_payload.insert(
+        "model".to_string(),
+        session
+            .metadata
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5".to_string())
+            .into(),
+    );
+    turn_context_payload.insert(
+        "personality".to_string(),
+        session
+            .metadata
+            .extra
+            .get("codex_personality")
+            .cloned()
+            .unwrap_or_else(|| Value::String("pragmatic".to_string())),
+    );
+    turn_context_payload.insert(
+        "collaboration_mode".to_string(),
+        session
+            .metadata
+            .extra
+            .get("codex_collaboration_mode")
+            .cloned()
+            .unwrap_or_else(|| json!({ "mode": "default" })),
+    );
+    if let Some(user_instructions) = session.metadata.extra.get("codex_user_instructions") {
+        turn_context_payload.insert("user_instructions".to_string(), user_instructions.clone());
+    }
 
     write_json_line(
         &mut file,
         &json!({
             "timestamp": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             "type": "turn_context",
-            "payload": {
-                "turn_id": Uuid::now_v7().to_string(),
-                "cwd": cwd,
-                "current_date": created_at.with_timezone(&Local).format("%Y-%m-%d").to_string(),
-                "timezone": Local::now().offset().to_string(),
-                "approval_policy": "on-request",
-                "sandbox_policy": { "type": "workspace-write" },
-                "model": session.metadata.model.clone().unwrap_or_else(|| "gpt-5".to_string()),
-                "personality": "pragmatic",
-                "collaboration_mode": { "mode": "default" }
-            }
+            "payload": turn_context_payload,
         }),
     )?;
 
     for event in &session.events {
         match event {
             SessionEvent::Message(message) => {
-                if !matches!(message.role.as_str(), "user" | "assistant") {
-                    continue;
-                }
-
                 let blocks = message
                     .blocks
                     .iter()
                     .filter_map(|block| {
                         let text = block.text.clone()?;
-                        let mapped_kind = match message.role.as_str() {
-                            "user" => "input_text",
-                            _ => "output_text",
-                        };
-                        Some(json!({
-                            "type": mapped_kind,
-                            "text": text,
-                        }))
+                        let mapped_kind = codex_block_kind(&message.role, &block.kind);
+                        let mut object = Map::new();
+                        object.insert("type".to_string(), Value::String(mapped_kind.to_string()));
+                        object.insert("text".to_string(), Value::String(text));
+                        if let Some(Value::Object(extra)) = &block.data {
+                            object.extend(extra.clone());
+                        }
+                        Some(Value::Object(object))
                     })
                     .collect::<Vec<_>>();
 
@@ -604,11 +735,59 @@ fn collapse_whitespace(text: &str) -> String {
     collapsed.chars().take(80).collect()
 }
 
+fn copy_if_present(
+    payload: &serde_json::Map<String, Value>,
+    metadata: &mut SessionMetadata,
+    input_key: &str,
+    output_key: &str,
+) {
+    if let Some(value) = payload.get(input_key) {
+        metadata.extra.insert(output_key.to_string(), value.clone());
+    }
+}
+
+fn extra_string(metadata: &SessionMetadata, key: &str) -> Option<String> {
+    metadata
+        .extra
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn codex_session_id(candidate: &str) -> String {
     if Uuid::parse_str(candidate).is_ok() {
         candidate.to_string()
     } else {
         Uuid::now_v7().to_string()
+    }
+}
+
+fn codex_cli_version(metadata: &SessionMetadata) -> String {
+    if metadata.source_format == Some(SessionFormat::Codex) {
+        metadata
+            .platform_version
+            .clone()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    } else {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
+}
+
+fn local_timezone_name_or_offset() -> String {
+    std::env::var("TZ").unwrap_or_else(|_| Local::now().offset().to_string())
+}
+
+fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
+    match original_kind {
+        "input_text" => "input_text",
+        "output_text" => "output_text",
+        _ => {
+            if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            }
+        }
     }
 }
 

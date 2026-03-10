@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,7 @@ use crate::ir::{
 
 pub struct ClaudeMaterialization {
     pub session_file: PathBuf,
+    pub history_file: Option<PathBuf>,
 }
 
 pub fn load(path: &Path) -> Result<UniversalSession> {
@@ -184,58 +185,111 @@ fn import_assistant_entry(events: &mut Vec<SessionEvent>, value: &Value) {
     for (index, item) in content.into_iter().enumerate() {
         match item.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
-                if !message_blocks.is_empty() {
-                    events.push(SessionEvent::Message(MessageEvent {
-                        id: uuid.clone().map(|base| format!("{base}:msg:{index}")),
-                        parent_id: parent_uuid.clone(),
-                        role: "assistant".to_string(),
-                        timestamp,
-                        blocks: std::mem::take(&mut message_blocks),
-                        metadata: shared_metadata.clone(),
-                    }));
-                }
-
-                if !reasoning_blocks.is_empty() {
-                    events.push(SessionEvent::Reasoning(ReasoningEvent {
-                        id: uuid.clone().map(|base| format!("{base}:reasoning:{index}")),
-                        parent_id: parent_uuid.clone(),
-                        timestamp,
-                        summary: std::mem::take(&mut reasoning_blocks),
-                        metadata: shared_metadata.clone(),
-                    }));
-                }
+                flush_reasoning(
+                    events,
+                    &mut reasoning_blocks,
+                    uuid.clone().map(|base| format!("{base}:reasoning:{index}")),
+                    parent_uuid.clone(),
+                    timestamp,
+                    &shared_metadata,
+                );
+                flush_message(
+                    events,
+                    &mut message_blocks,
+                    uuid.clone().map(|base| format!("{base}:msg:{index}")),
+                    parent_uuid.clone(),
+                    timestamp,
+                    &shared_metadata,
+                );
 
                 import_tool_use_block(events, &item, timestamp, uuid.clone(), parent_uuid.clone());
             }
             Some("thinking") => {
+                flush_message(
+                    events,
+                    &mut message_blocks,
+                    uuid.clone().map(|base| format!("{base}:msg:{index}")),
+                    parent_uuid.clone(),
+                    timestamp,
+                    &shared_metadata,
+                );
                 if let Some(text) = item.get("thinking").and_then(Value::as_str) {
                     reasoning_blocks.push(text.to_string());
                 }
             }
-            _ => message_blocks.push(normalize_block(&item)),
+            _ => {
+                flush_reasoning(
+                    events,
+                    &mut reasoning_blocks,
+                    uuid.clone().map(|base| format!("{base}:reasoning:{index}")),
+                    parent_uuid.clone(),
+                    timestamp,
+                    &shared_metadata,
+                );
+                message_blocks.push(normalize_block(&item));
+            }
         }
     }
 
-    if !message_blocks.is_empty() {
-        events.push(SessionEvent::Message(MessageEvent {
-            id: uuid.clone(),
-            parent_id: parent_uuid.clone(),
-            role: "assistant".to_string(),
-            timestamp,
-            blocks: message_blocks,
-            metadata: shared_metadata.clone(),
-        }));
+    flush_reasoning(
+        events,
+        &mut reasoning_blocks,
+        uuid.clone().map(|base| format!("{base}:reasoning")),
+        parent_uuid.clone(),
+        timestamp,
+        &shared_metadata,
+    );
+    flush_message(
+        events,
+        &mut message_blocks,
+        uuid,
+        parent_uuid,
+        timestamp,
+        &shared_metadata,
+    );
+}
+
+fn flush_message(
+    events: &mut Vec<SessionEvent>,
+    blocks: &mut Vec<ContentBlock>,
+    id: Option<String>,
+    parent_id: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+    metadata: &BTreeMap<String, Value>,
+) {
+    if blocks.is_empty() {
+        return;
     }
 
-    if !reasoning_blocks.is_empty() {
-        events.push(SessionEvent::Reasoning(ReasoningEvent {
-            id: uuid.map(|base| format!("{base}:reasoning")),
-            parent_id: parent_uuid,
-            timestamp,
-            summary: reasoning_blocks,
-            metadata: shared_metadata,
-        }));
+    events.push(SessionEvent::Message(MessageEvent {
+        id,
+        parent_id,
+        role: "assistant".to_string(),
+        timestamp,
+        blocks: std::mem::take(blocks),
+        metadata: metadata.clone(),
+    }));
+}
+
+fn flush_reasoning(
+    events: &mut Vec<SessionEvent>,
+    summary: &mut Vec<String>,
+    id: Option<String>,
+    parent_id: Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+    metadata: &BTreeMap<String, Value>,
+) {
+    if summary.is_empty() {
+        return;
     }
+
+    events.push(SessionEvent::Reasoning(ReasoningEvent {
+        id,
+        parent_id,
+        timestamp,
+        summary: std::mem::take(summary),
+        metadata: metadata.clone(),
+    }));
 }
 
 fn import_tool_use_block(
@@ -319,11 +373,27 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         .git_branch
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
+    let created_at = session.metadata.created_at.or_else(|| {
+        session
+            .events
+            .iter()
+            .filter_map(SessionEvent::timestamp)
+            .min()
+    });
     let model = session
         .metadata
         .model
         .clone()
         .unwrap_or_else(|| "imported".to_string());
+    let version = if session.metadata.source_format == Some(SessionFormat::Claude) {
+        session
+            .metadata
+            .platform_version
+            .clone()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    } else {
+        env!("CARGO_PKG_VERSION").to_string()
+    };
 
     let mut file = File::create(&materialization.session_file).with_context(|| {
         format!(
@@ -338,24 +408,21 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     for event in &session.events {
         match event {
             SessionEvent::Message(message) => {
-                if !matches!(message.role.as_str(), "user" | "assistant") {
-                    continue;
-                }
-
                 let event_uuid = Uuid::new_v4().to_string();
-                let content = encode_message_blocks(&message.blocks);
+                let (projected_role, projected_blocks) = project_message_for_claude(message);
+                let content = encode_message_blocks(&projected_blocks);
                 if content.is_null() {
                     continue;
                 }
 
-                let line = if message.role == "assistant" {
+                let line = if projected_role == "assistant" {
                     json!({
                         "parentUuid": previous_uuid,
                         "isSidechain": false,
                         "userType": "external",
                         "cwd": cwd,
                         "sessionId": session_id,
-                        "version": env!("CARGO_PKG_VERSION"),
+                        "version": version,
                         "gitBranch": git_branch,
                         "message": {
                             "model": model,
@@ -377,7 +444,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "userType": "external",
                         "cwd": cwd,
                         "sessionId": session_id,
-                        "version": env!("CARGO_PKG_VERSION"),
+                        "version": version,
                         "gitBranch": git_branch,
                         "type": "user",
                         "message": {
@@ -411,7 +478,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "userType": "external",
                     "cwd": cwd,
                     "sessionId": session_id,
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": version,
                     "gitBranch": git_branch,
                     "message": {
                         "model": model,
@@ -437,7 +504,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "userType": "external",
                     "cwd": cwd,
                     "sessionId": session_id,
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": version,
                     "gitBranch": git_branch,
                     "message": {
                         "model": model,
@@ -471,7 +538,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "userType": "external",
                     "cwd": cwd,
                     "sessionId": session_id,
-                    "version": env!("CARGO_PKG_VERSION"),
+                    "version": version,
                     "gitBranch": git_branch,
                     "type": "user",
                     "message": {
@@ -494,6 +561,31 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         }
     }
 
+    if let Some(history_file) = &materialization.history_file {
+        if let Some(parent) = history_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let mut history = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(history_file)
+            .with_context(|| format!("failed to open {}", history_file.display()))?;
+        write_json_line(
+            &mut history,
+            &json!({
+                "display": derive_title(session).unwrap_or_else(|| "Imported session".to_string()),
+                "pastedContents": {},
+                "timestamp": created_at
+                    .unwrap_or_else(Utc::now)
+                    .timestamp_millis(),
+                "project": cwd.display().to_string(),
+                "sessionId": session_id,
+            }),
+        )?;
+    }
+
     Ok(materialization.session_file)
 }
 
@@ -501,6 +593,7 @@ fn plan_output(session: &UniversalSession, output: &Path) -> ClaudeMaterializati
     if output.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         return ClaudeMaterialization {
             session_file: output.to_path_buf(),
+            history_file: None,
         };
     }
 
@@ -516,6 +609,7 @@ fn plan_output(session: &UniversalSession, output: &Path) -> ClaudeMaterializati
             .join("projects")
             .join(slug)
             .join(format!("{session_id}.jsonl")),
+        history_file: Some(output.join("history.jsonl")),
     }
 }
 
@@ -542,7 +636,8 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
     }
 
     if blocks.len() == 1
-        && blocks[0].kind == "text"
+        && claude_block_kind(&blocks[0].kind) == "text"
+        && blocks[0].data.is_none()
         && let Some(text) = &blocks[0].text
     {
         return Value::String(text.clone());
@@ -552,9 +647,17 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
         .iter()
         .map(|block| {
             let mut object = Map::new();
-            object.insert("type".to_string(), Value::String(block.kind.clone()));
+            object.insert(
+                "type".to_string(),
+                Value::String(claude_block_kind(&block.kind).to_string()),
+            );
             if let Some(text) = &block.text {
-                object.insert("text".to_string(), Value::String(text.clone()));
+                let text_key = if block.kind == "thinking" {
+                    "thinking"
+                } else {
+                    "text"
+                };
+                object.insert(text_key.to_string(), Value::String(text.clone()));
             }
             if let Some(data) = &block.data {
                 if let Value::Object(extra) = data {
@@ -683,5 +786,34 @@ fn json_to_string(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn project_message_for_claude(message: &MessageEvent) -> (&'static str, Vec<ContentBlock>) {
+    match message.role.as_str() {
+        "assistant" => ("assistant", message.blocks.clone()),
+        "user" => ("user", message.blocks.clone()),
+        other => {
+            let mut blocks = message.blocks.clone();
+            let prefix = format!("[transession imported {other} message]");
+            match blocks.first_mut() {
+                Some(block) if block.text.is_some() => {
+                    let text = block.text.take().unwrap_or_default();
+                    block.text = Some(format!("{prefix}\n{text}"));
+                }
+                _ => blocks.insert(0, ContentBlock::text("text", prefix)),
+            }
+            ("user", blocks)
+        }
+    }
+}
+
+fn claude_block_kind(kind: &str) -> &'static str {
+    match kind {
+        "thinking" => "thinking",
+        "tool_use" => "tool_use",
+        "tool_result" => "tool_result",
+        "input_text" | "output_text" | "text" => "text",
+        _ => "text",
     }
 }

@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::formats::{self, detect_format, load_session, materialize};
+use crate::formats::{self, load_session, materialize, resolve_input};
 use crate::ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
 
 #[derive(Debug, Parser)]
@@ -79,10 +79,7 @@ pub fn run() -> Result<()> {
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {
-    let detected = match args.from.explicit() {
-        Some(format) => format,
-        None => detect_format(&args.input)?,
-    };
+    let detected = resolve_input(&args.input, args.from)?.format;
     let session = load_session(&args.input, args.from)?;
     let summary = summarize(&session);
 
