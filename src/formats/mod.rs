@@ -156,6 +156,14 @@ pub fn materialize(
     }
 }
 
+pub fn default_output_root(target: SessionFormat) -> Result<PathBuf> {
+    match target {
+        SessionFormat::Codex => codex_root(),
+        SessionFormat::Claude => claude_root(),
+        SessionFormat::Ir => bail!("IR output requires an explicit file path"),
+    }
+}
+
 fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
     let root = codex_root()?;
     let sessions_root = root.join("sessions");

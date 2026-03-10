@@ -1,23 +1,40 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::formats::{self, load_session, materialize, resolve_input};
+use crate::formats::{self, default_output_root, load_session, materialize, resolve_input};
 use crate::ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
-    about = "Translate session storage between Codex, Claude, and a universal IR"
+    about = "Translate session storage between Codex, Claude, and a universal IR",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    after_help = "Quick usage:\n  transession --from claude --to codex <SESSION_ID>\n  transession --from codex --to claude <SESSION_ID>\n\nAdvanced usage remains available through subcommands such as inspect/import/export/convert."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+
+    #[arg(long, value_enum)]
+    from: Option<SourceFormat>,
+
+    #[arg(long, value_enum)]
+    to: Option<SessionFormat>,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    keep_session_id: bool,
+
+    input: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -71,11 +88,42 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Inspect(args) => inspect(args),
-        Command::Import(args) => import(args),
-        Command::Export(args) => export(args),
-        Command::Convert(args) => convert(args),
+        Some(Command::Inspect(args)) => inspect(args),
+        Some(Command::Import(args)) => import(args),
+        Some(Command::Export(args)) => export(args),
+        Some(Command::Convert(args)) => convert(args),
+        None => quick_convert(cli),
     }
+}
+
+fn quick_convert(cli: Cli) -> Result<()> {
+    let input = cli.input.context("missing input session id or path")?;
+    let from = cli.from.unwrap_or(SourceFormat::Auto);
+    let to = cli
+        .to
+        .context("missing --to; example: transession --from claude --to codex <SESSION_ID>")?;
+
+    let mut session = load_session(&input, from)
+        .with_context(|| format!("failed to load source session {}", input.display()))?;
+
+    if to == SessionFormat::Ir && cli.output.is_none() {
+        bail!("IR output requires --output with a target file path");
+    }
+
+    let output = match cli.output {
+        Some(path) => path,
+        None => default_output_root(to)?,
+    };
+
+    maybe_rekey_session(&mut session, !cli.keep_session_id && to != SessionFormat::Ir, to);
+    let path = materialize(&session, to, &output)?;
+
+    println!("created {} session: {}", format_name(to), session.metadata.session_id);
+    println!("stored at: {}", path.display());
+    if let Some(hint) = resume_hint(to, &session.metadata.session_id) {
+        println!("resume with: {hint}");
+    }
+    Ok(())
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {
@@ -176,5 +224,13 @@ fn format_name(format: SessionFormat) -> &'static str {
         SessionFormat::Ir => "ir",
         SessionFormat::Codex => "codex",
         SessionFormat::Claude => "claude",
+    }
+}
+
+fn resume_hint(format: SessionFormat, session_id: &str) -> Option<String> {
+    match format {
+        SessionFormat::Codex => Some(format!("codex resume {session_id}")),
+        SessionFormat::Claude => Some(format!("claude -r {session_id}")),
+        SessionFormat::Ir => None,
     }
 }

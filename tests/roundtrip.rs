@@ -186,3 +186,27 @@ fn resolves_claude_session_ids_from_default_store_roots() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("\"detected_format\": \"claude\""));
 }
+
+#[test]
+fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
+    let source_session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("codex")
+        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_CODEX_HOME", target_home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("created codex session:"));
+    assert!(stdout.contains("resume with: codex resume "));
+}

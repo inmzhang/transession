@@ -1,89 +1,110 @@
 # transession
 
-`transession` is a Rust CLI for translating interactive session history between:
+`transession` translates interactive session history between Codex and Claude Code.
 
-- Codex session storage
-- Claude Code session storage
-- A universal JSON IR (`transession/v1`)
-
-The goal is pragmatic interoperability: preserve messages, reasoning summaries, tool calls, tool results, timestamps, and key workspace metadata well enough to resume work in another tool without manually reconstructing the transcript.
-
-## AI Disclaimer
-
-This project was built with Codex. The code and documentation were generated and refined collaboratively with AI assistance, then validated locally with tests and CLI smoke checks.
-
-## Status
-
-This implementation targets the durable JSON and JSONL session logs and also writes the lightweight discovery files needed for native resume flows such as Codex `session_index.jsonl` and Claude `history.jsonl`.
-
-It still does **not** attempt to reproduce every platform-specific side channel. Notably, it does not recreate:
-
-- opaque reasoning payloads or token accounting side data
-- Codex SQLite state or shell snapshot sidecars
-- Claude subagent trees or tool-result sidecar directories
-- platform-specific runtime caches that are not part of the main conversation log
-
-## Commands
-
-Inspect a session by file path or native session id:
+The default workflow is native-to-native conversion by session id:
 
 ```bash
-cargo run -- inspect ./examples/session.json
-cargo run -- inspect 123e4567-e89b-12d3-a456-426614174000 --from claude
-cargo run -- inspect 019cd69f-2838-76d2-b3d6-ed71ab2bb329 --from codex
+transession --from claude --to codex <SESSION_ID>
+transession --from codex --to claude <SESSION_ID>
 ```
 
-Normalize a native session into the IR:
+`transession` automatically creates a fresh target session id, writes the converted session into the target tool's local storage, and prints the exact resume command to use next.
+
+## Install
+
+Once the crate is published on crates.io:
 
 ```bash
-cargo run -- import 123e4567-e89b-12d3-a456-426614174000 ./session.json --from claude
+cargo install transession
 ```
 
-Export IR into a target platform:
+From the repository:
 
 ```bash
-cargo run -- export ./session.json ./out/codex-home --to codex --new-session-id
+cargo install --path .
 ```
 
-Convert directly between native formats:
+From source for local development:
 
 ```bash
-cargo run -- convert 123e4567-e89b-12d3-a456-426614174000 ./out/codex-home --to codex --from claude --new-session-id
-cargo run -- convert 019cd69f-2838-76d2-b3d6-ed71ab2bb329 ./out/claude-home --to claude --from codex --new-session-id
+git clone https://github.com/inmzhang/transession.git
+cd transession
+cargo build --release
 ```
 
-## Native Session Id Lookup
+## Quick Start
+
+Convert a Claude session into Codex and immediately resume it:
+
+```bash
+transession --from claude --to codex <CLAUDE_SESSION_ID>
+codex resume <NEW_CODEX_SESSION_ID>
+```
+
+Convert a Codex session into Claude and resume it:
+
+```bash
+transession --from codex --to claude <CODEX_SESSION_ID>
+claude -r <NEW_CLAUDE_SESSION_ID>
+```
+
+If you want to write into non-default storage roots, override the target location explicitly:
+
+```bash
+transession --from claude --to codex <SESSION_ID> --output ./tmp/codex-home
+transession --from codex --to claude <SESSION_ID> --output ./tmp/claude-home
+```
+
+## Session Lookup
 
 For Codex and Claude inputs, `transession` accepts either:
 
+- a native session id
 - a direct session file path
-- the native session id used by `codex resume <id>` or `claude -r <id>`
 
 By default it searches:
 
 - Codex: `TRANSESSION_CODEX_HOME`, then `CODEX_HOME`, then `~/.codex`
 - Claude: `TRANSESSION_CLAUDE_HOME`, then `CLAUDE_HOME`, then `~/.claude`
 
-This lets you translate straight from a session id without manually locating the backing JSONL file.
+That means you can usually use the same id you would pass to `codex resume` or `claude -r`.
 
-## Output Modes
+## What Gets Preserved
 
-When `--output` ends in `.jsonl`, `transession` writes a single session file.
+`transession` preserves the main conversation state needed for practical handoff:
 
-When exporting to a directory:
+- user and assistant messages
+- reasoning summaries
+- tool calls and tool results
+- timestamps
+- working directory and branch hints
+- lightweight platform metadata needed for native session discovery
 
-- `codex` writes a canonical file under `sessions/YYYY/MM/DD/` and appends to `session_index.jsonl`
-- `claude` writes a canonical file under `projects/<cwd-slug>/` and appends to `history.jsonl`
+## Caveats
 
-## IR Shape
+`transession` intentionally focuses on the durable conversation logs and lightweight resume metadata. It does not recreate every platform-specific side channel.
 
-The universal IR is a readable JSON document with:
+Known omissions:
 
-- session metadata: ids, cwd, branch, timestamps, model hints, extra platform hints
-- ordered events:
-  - `message`
-  - `reasoning`
-  - `tool_call`
-  - `tool_result`
+- opaque reasoning payloads and token-accounting side data
+- Codex SQLite state and shell snapshot sidecars
+- Claude subagent trees and tool-result sidecar directories
+- platform-specific runtime caches outside the main session log
 
-This keeps the core conversation portable without baking either platform's envelope model into the canonical representation.
+## Advanced Usage
+
+There is also a portable intermediate representation for debugging and advanced workflows, but it is not the main interface.
+
+Advanced commands remain available:
+
+```bash
+transession inspect <SESSION_ID> --from claude
+transession import <SESSION_ID> ./session.json --from codex
+transession export ./session.json ./out/codex-home --to codex --new-session-id
+transession convert <SESSION_ID> ./out/claude-home --from codex --to claude --new-session-id
+```
+
+## AI Disclaimer
+
+This project was built with Codex. The code and documentation were generated and refined collaboratively with AI assistance, then validated locally with tests and CLI smoke checks.
