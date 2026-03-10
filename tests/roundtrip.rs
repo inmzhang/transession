@@ -114,6 +114,16 @@ fn materializes_canonical_codex_layout() {
         .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
         .unwrap();
     assert_eq!(registered_count, 1);
+    let (id, title, first_user_message): (String, String, String) = connection
+        .query_row(
+            "SELECT id, title, first_user_message FROM threads LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(id, session.metadata.session_id);
+    assert_eq!(title, id);
+    assert!(first_user_message.contains("continuous-codex.sh"));
 }
 
 #[test]
@@ -226,6 +236,29 @@ fn materialized_codex_sessions_include_turn_events() {
     assert_eq!(type_counts.get("turn_context"), Some(&2));
     assert_eq!(type_counts.get("event_msg"), Some(&9));
 
+    let session_meta = lines
+        .iter()
+        .find(|value| value.get("type").and_then(|value| value.as_str()) == Some("session_meta"))
+        .unwrap();
+    assert_eq!(
+        session_meta
+            .get("payload")
+            .and_then(|value| value.get("model_provider"))
+            .and_then(|value| value.as_str()),
+        Some("imported")
+    );
+
+    let turn_context = lines
+        .iter()
+        .find(|value| value.get("type").and_then(|value| value.as_str()) == Some("turn_context"))
+        .unwrap();
+    let turn_payload = turn_context.get("payload").unwrap();
+    assert!(turn_payload.get("model").is_none());
+    assert_eq!(
+        turn_payload.get("collaboration_mode"),
+        Some(&serde_json::json!({ "mode": "default" }))
+    );
+
     let event_types = lines
         .iter()
         .filter(|value| value.get("type").and_then(|value| value.as_str()) == Some("event_msg"))
@@ -266,6 +299,9 @@ fn materializes_canonical_claude_layout() {
         let value: serde_json::Value = serde_json::from_str(line).unwrap();
         if let Some(message) = value.get("message") {
             assert!(message.get("content").unwrap().is_array());
+            if value.get("type").and_then(|value| value.as_str()) == Some("assistant") {
+                assert!(message.get("model").is_none());
+            }
         }
     }
 }

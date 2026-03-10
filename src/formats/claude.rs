@@ -380,11 +380,6 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .filter_map(SessionEvent::timestamp)
             .min()
     });
-    let model = session
-        .metadata
-        .model
-        .clone()
-        .unwrap_or_else(|| "imported".to_string());
     let version = if session.metadata.source_format == Some(SessionFormat::Claude) {
         session
             .metadata
@@ -416,6 +411,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 }
 
                 let line = if projected_role == "assistant" {
+                    let assistant_message = claude_assistant_message(content, Value::Null);
                     json!({
                         "parentUuid": previous_uuid,
                         "isSidechain": false,
@@ -424,15 +420,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         "sessionId": session_id,
                         "version": version,
                         "gitBranch": git_branch,
-                        "message": {
-                            "model": model,
-                            "id": format!("msg_{}", Uuid::new_v4().simple()),
-                            "type": "message",
-                            "role": "assistant",
-                            "content": content,
-                            "stop_reason": Value::Null,
-                            "stop_sequence": Value::Null,
-                        },
+                        "message": assistant_message,
                         "type": "assistant",
                         "uuid": event_uuid,
                         "timestamp": event_timestamp(message.timestamp),
@@ -472,6 +460,8 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         })
                     })
                     .collect::<Vec<_>>();
+                let assistant_message =
+                    claude_assistant_message(Value::Array(content), Value::Null);
                 let line = json!({
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
@@ -480,15 +470,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "sessionId": session_id,
                     "version": version,
                     "gitBranch": git_branch,
-                    "message": {
-                        "model": model,
-                        "id": format!("msg_{}", Uuid::new_v4().simple()),
-                        "type": "message",
-                        "role": "assistant",
-                        "content": content,
-                        "stop_reason": Value::Null,
-                        "stop_sequence": Value::Null,
-                    },
+                    "message": assistant_message,
                     "type": "assistant",
                     "uuid": event_uuid,
                     "timestamp": event_timestamp(reasoning.timestamp),
@@ -498,6 +480,16 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             }
             SessionEvent::ToolCall(call) => {
                 let event_uuid = Uuid::new_v4().to_string();
+                let assistant_message = claude_assistant_message(
+                    json!([{
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "input": call.arguments,
+                        "caller": { "type": "direct" },
+                    }]),
+                    Value::String("tool_use".to_string()),
+                );
                 let line = json!({
                     "parentUuid": previous_uuid,
                     "isSidechain": false,
@@ -506,21 +498,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                     "sessionId": session_id,
                     "version": version,
                     "gitBranch": git_branch,
-                    "message": {
-                        "model": model,
-                        "id": format!("msg_{}", Uuid::new_v4().simple()),
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "tool_use",
-                            "id": call.call_id,
-                            "name": call.name,
-                            "input": call.arguments,
-                            "caller": { "type": "direct" },
-                        }],
-                        "stop_reason": "tool_use",
-                        "stop_sequence": Value::Null,
-                    },
+                    "message": assistant_message,
                     "type": "assistant",
                     "uuid": event_uuid,
                     "timestamp": event_timestamp(call.timestamp),
@@ -662,6 +640,20 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
         })
         .collect::<Vec<_>>();
     Value::Array(encoded)
+}
+
+fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
+    let mut message = Map::new();
+    message.insert(
+        "id".to_string(),
+        Value::String(format!("msg_{}", Uuid::new_v4().simple())),
+    );
+    message.insert("type".to_string(), Value::String("message".to_string()));
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert("content".to_string(), content);
+    message.insert("stop_reason".to_string(), stop_reason);
+    message.insert("stop_sequence".to_string(), Value::Null);
+    Value::Object(message)
 }
 
 fn encode_tool_result_output(output: &Value) -> Value {

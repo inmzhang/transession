@@ -103,6 +103,8 @@ That means you can usually use the same id you would pass to `codex resume` or `
 
 `transession` intentionally focuses on the durable conversation logs and lightweight resume metadata. It does not recreate every platform-specific side channel.
 
+The current test suite covers the main happy paths, but real-world session logs are messy and platform behavior keeps evolving. You should expect some edge cases and translation failures to surface over time, and the converter will likely need further iteration as those cases are discovered.
+
 Known omissions:
 
 - opaque reasoning payloads and token-accounting side data

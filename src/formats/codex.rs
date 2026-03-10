@@ -393,13 +393,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
     );
     session_meta_payload.insert(
         "model_provider".to_string(),
-        Value::String(
-            session
-                .metadata
-                .model
-                .clone()
-                .unwrap_or_else(|| "imported".to_string()),
-        ),
+        Value::String(exported_codex_model_provider()),
     );
     session_meta_payload.insert(
         "base_instructions".to_string(),
@@ -583,6 +577,8 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
 
     close_turn(&mut file, &mut active_turn, updated_at)?;
 
+    let thread_name = exported_codex_thread_name(session, &session_id);
+
     if let Some(session_index) = &materialization.session_index {
         if let Some(parent) = session_index.parent() {
             fs::create_dir_all(parent)
@@ -599,7 +595,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             &mut index,
             &json!({
                 "id": session_id,
-                "thread_name": derive_title(session).unwrap_or_else(|| "Imported session".to_string()),
+                "thread_name": thread_name.clone(),
                 "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             }),
         )?;
@@ -611,6 +607,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             session,
             &materialization.session_file,
             &session_id,
+            &thread_name,
             created_at,
             updated_at,
         )?;
@@ -780,6 +777,21 @@ fn local_timezone_name_or_offset() -> String {
     std::env::var("TZ").unwrap_or_else(|_| Local::now().offset().to_string())
 }
 
+fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> String {
+    if session.metadata.source_format == Some(SessionFormat::Codex) {
+        return derive_title(session).unwrap_or_else(|| session_id.to_string());
+    }
+    session_id.to_string()
+}
+
+fn exported_codex_model_provider() -> String {
+    "imported".to_string()
+}
+
+fn exported_codex_collaboration_mode() -> Value {
+    json!({ "mode": "default" })
+}
+
 fn start_turn(
     file: &mut impl Write,
     metadata: &SessionMetadata,
@@ -788,11 +800,7 @@ fn start_turn(
 ) -> Result<ActiveTurn> {
     let turn_id = Uuid::now_v7().to_string();
     let rendered_timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
-    let collaboration_mode = metadata
-        .extra
-        .get("codex_collaboration_mode")
-        .cloned()
-        .unwrap_or_else(|| json!({ "mode": "default" }));
+    let collaboration_mode = exported_codex_collaboration_mode();
     let collaboration_mode_kind = collaboration_mode
         .get("mode")
         .and_then(Value::as_str)
@@ -893,14 +901,6 @@ fn build_turn_context_payload(
             .unwrap_or_else(|| json!({ "type": "workspace-write" })),
     );
     turn_context_payload.insert(
-        "model".to_string(),
-        metadata
-            .model
-            .clone()
-            .unwrap_or_else(|| "gpt-5".to_string())
-            .into(),
-    );
-    turn_context_payload.insert(
         "personality".to_string(),
         metadata
             .extra
@@ -910,11 +910,7 @@ fn build_turn_context_payload(
     );
     turn_context_payload.insert(
         "collaboration_mode".to_string(),
-        metadata
-            .extra
-            .get("codex_collaboration_mode")
-            .cloned()
-            .unwrap_or_else(|| json!({ "mode": "default" })),
+        exported_codex_collaboration_mode(),
     );
     if let Some(user_instructions) = metadata.extra.get("codex_user_instructions") {
         turn_context_payload.insert("user_instructions".to_string(), user_instructions.clone());
@@ -1003,6 +999,7 @@ fn register_thread_in_sqlite(
     session: &UniversalSession,
     session_file: &Path,
     session_id: &str,
+    thread_name: &str,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 ) -> Result<()> {
@@ -1013,7 +1010,7 @@ fn register_thread_in_sqlite(
 
     let connection = Connection::open(&sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
-    let title = derive_title(session).unwrap_or_else(|| "Imported session".to_string());
+    let title = thread_name.to_string();
     let first_user_message = first_user_message(session).unwrap_or_else(|| title.clone());
     let cwd = session
         .metadata
@@ -1029,11 +1026,7 @@ fn register_thread_in_sqlite(
         .unwrap_or_else(|| "{\"type\":\"workspace-write\"}".to_string());
     let approval_mode = extra_string(&session.metadata, "codex_approval_policy")
         .unwrap_or_else(|| "on-request".to_string());
-    let model_provider = session
-        .metadata
-        .model
-        .clone()
-        .unwrap_or_else(|| "imported".to_string());
+    let model_provider = exported_codex_model_provider();
     let git_branch = session.metadata.git_branch.clone();
     let has_user_event = session
         .events
