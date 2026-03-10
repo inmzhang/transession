@@ -427,10 +427,11 @@ fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
 
 #[test]
 fn quick_cli_opens_target_agent_by_default() {
-    let source_session =
+    let mut source_session =
         load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
+    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
     materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
 
     let log_path = target_home.path().join("launcher.log");

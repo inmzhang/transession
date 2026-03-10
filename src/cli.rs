@@ -333,7 +333,7 @@ fn resume_command(
         SessionFormat::Ir => {}
     }
 
-    if let Some(cwd) = session_cwd {
+    if let Some(cwd) = session_cwd.filter(|cwd| cwd.is_dir()) {
         command.current_dir(cwd);
     }
 
