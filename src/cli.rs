@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -16,7 +18,7 @@ use crate::ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
     about = "Translate session storage between Codex, Claude, and a universal IR",
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
-    after_help = "Quick usage:\n  transession --from claude --to codex <SESSION_ID>\n  transession --from codex --to claude <SESSION_ID>\n\nAdvanced usage remains available through subcommands such as inspect/import/export/convert."
+    after_help = "Quick usage:\n  transession --from claude --to codex <SESSION_ID>\n  transession --from codex --to claude <SESSION_ID>\n  transession --from claude --to codex <SESSION_ID> --no-open\n\nAdvanced usage remains available through subcommands such as inspect/import/export/convert."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,6 +35,9 @@ struct Cli {
 
     #[arg(long)]
     keep_session_id: bool,
+
+    #[arg(long)]
+    no_open: bool,
 
     input: Option<PathBuf>,
 }
@@ -114,15 +119,31 @@ fn quick_convert(cli: Cli) -> Result<()> {
         Some(path) => path,
         None => default_output_root(to)?,
     };
+    let wrote_standalone_jsonl = output.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
 
-    maybe_rekey_session(&mut session, !cli.keep_session_id && to != SessionFormat::Ir, to);
+    maybe_rekey_session(
+        &mut session,
+        !cli.keep_session_id && to != SessionFormat::Ir,
+        to,
+    );
     let path = materialize(&session, to, &output)?;
 
-    println!("created {} session: {}", format_name(to), session.metadata.session_id);
+    println!(
+        "created {} session: {}",
+        format_name(to),
+        session.metadata.session_id
+    );
     println!("stored at: {}", path.display());
     if let Some(hint) = resume_hint(to, &session.metadata.session_id) {
         println!("resume with: {hint}");
     }
+    maybe_open_session(
+        to,
+        &session.metadata.session_id,
+        &output,
+        wrote_standalone_jsonl,
+        cli.no_open,
+    )?;
     Ok(())
 }
 
@@ -233,4 +254,89 @@ fn resume_hint(format: SessionFormat, session_id: &str) -> Option<String> {
         SessionFormat::Claude => Some(format!("claude -r {session_id}")),
         SessionFormat::Ir => None,
     }
+}
+
+fn maybe_open_session(
+    format: SessionFormat,
+    session_id: &str,
+    output_root: &std::path::Path,
+    wrote_standalone_jsonl: bool,
+    no_open: bool,
+) -> Result<()> {
+    if no_open || format == SessionFormat::Ir {
+        return Ok(());
+    }
+
+    if wrote_standalone_jsonl {
+        bail!(
+            "automatic open requires writing into a native Codex/Claude home directory, not a standalone .jsonl file; pass --no-open to keep the conversion only"
+        );
+    }
+
+    let mut command = resume_command(format, session_id, output_root)?;
+    println!("opening {} session...", format_name(format));
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch {}", format_name(format)))?;
+    if !status.success() {
+        bail!(
+            "{} exited with status {}",
+            format_name(format),
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        );
+    }
+
+    Ok(())
+}
+
+fn resume_command(
+    format: SessionFormat,
+    session_id: &str,
+    output_root: &std::path::Path,
+) -> Result<ProcessCommand> {
+    let mut command = match format {
+        SessionFormat::Codex => {
+            let mut cmd = ProcessCommand::new(codex_binary());
+            cmd.arg("resume").arg(session_id);
+            cmd
+        }
+        SessionFormat::Claude => {
+            let mut cmd = ProcessCommand::new(claude_binary());
+            cmd.arg("-r").arg(session_id);
+            cmd
+        }
+        SessionFormat::Ir => bail!("cannot open IR directly"),
+    };
+
+    command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    match format {
+        SessionFormat::Codex => {
+            command.env("CODEX_HOME", output_root);
+        }
+        SessionFormat::Claude => {
+            command.env("CLAUDE_HOME", output_root);
+        }
+        SessionFormat::Ir => {}
+    }
+
+    Ok(command)
+}
+
+fn codex_binary() -> String {
+    std::env::var("TRANSESSION_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+}
+
+fn claude_binary() -> String {
+    std::env::var("TRANSESSION_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }

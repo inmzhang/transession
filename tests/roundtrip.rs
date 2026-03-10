@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use tempfile::tempdir;
@@ -189,7 +190,8 @@ fn resolves_claude_session_ids_from_default_store_roots() {
 
 #[test]
 fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
-    let source_session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let source_session =
+        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
     materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
@@ -200,6 +202,7 @@ fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
         .arg("--to")
         .arg("codex")
         .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .arg("--no-open")
         .env("TRANSESSION_CLAUDE_HOME", source_home.path())
         .env("TRANSESSION_CODEX_HOME", target_home.path())
         .output()
@@ -209,4 +212,46 @@ fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("created codex session:"));
     assert!(stdout.contains("resume with: codex resume "));
+}
+
+#[test]
+fn quick_cli_opens_target_agent_by_default() {
+    let source_session =
+        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
+
+    let log_path = target_home.path().join("launcher.log");
+    let script_path = target_home.path().join("fake-codex.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CODEX_HOME=%s\\n' \"$CODEX_HOME\" >> \"{}\"\n",
+            log_path.display(),
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("codex")
+        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .arg("--output")
+        .arg(target_home.path())
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("TRANSESSION_CODEX_BIN", &script_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("resume"));
+    assert!(log.contains("CODEX_HOME="));
 }

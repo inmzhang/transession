@@ -2,30 +2,48 @@
 
 `transession` translates interactive session history between Codex and Claude Code.
 
-The default workflow is native-to-native conversion by session id:
+The default workflow is direct native-to-native conversion by session id:
 
 ```bash
 transession --from claude --to codex <SESSION_ID>
 transession --from codex --to claude <SESSION_ID>
 ```
 
-`transession` automatically creates a fresh target session id, writes the converted session into the target tool's local storage, and prints the exact resume command to use next.
+By default, `transession`:
+
+- resolves the source session id from the local Claude or Codex store
+- creates a fresh target session id automatically
+- writes the translated session into the target tool's storage
+- immediately opens the translated session in the target agent
+
+If you only want the translation and do not want to start the target agent yet:
+
+```bash
+transession --from claude --to codex <SESSION_ID> --no-open
+transession --from codex --to claude <SESSION_ID> --no-open
+```
 
 ## Install
 
-Once the crate is published on crates.io:
+After the crate is published on crates.io:
 
 ```bash
 cargo install transession
 ```
 
-From the repository:
+Before publication, install directly from GitHub:
+
+```bash
+cargo install --git https://github.com/inmzhang/transession.git
+```
+
+From a local checkout:
 
 ```bash
 cargo install --path .
 ```
 
-From source for local development:
+For development:
 
 ```bash
 git clone https://github.com/inmzhang/transession.git
@@ -35,26 +53,26 @@ cargo build --release
 
 ## Quick Start
 
-Convert a Claude session into Codex and immediately resume it:
+Convert a Claude session into Codex and open the translated Codex session immediately:
 
 ```bash
 transession --from claude --to codex <CLAUDE_SESSION_ID>
-codex resume <NEW_CODEX_SESSION_ID>
 ```
 
-Convert a Codex session into Claude and resume it:
+Convert a Codex session into Claude and open the translated Claude session immediately:
 
 ```bash
 transession --from codex --to claude <CODEX_SESSION_ID>
-claude -r <NEW_CLAUDE_SESSION_ID>
 ```
 
-If you want to write into non-default storage roots, override the target location explicitly:
+If you want the translated session to be written somewhere else first, override the target root explicitly:
 
 ```bash
 transession --from claude --to codex <SESSION_ID> --output ./tmp/codex-home
 transession --from codex --to claude <SESSION_ID> --output ./tmp/claude-home
 ```
+
+When opening after translation, `transession` launches the target CLI with the translated session id. For custom output roots, it also sets `CODEX_HOME` or `CLAUDE_HOME` for the launched process.
 
 ## Session Lookup
 
@@ -92,9 +110,65 @@ Known omissions:
 - Claude subagent trees and tool-result sidecar directories
 - platform-specific runtime caches outside the main session log
 
+## Development
+
+Local development checks:
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+Pre-commit hooks are configured in `.pre-commit-config.yaml`.
+
+To enable them locally:
+
+```bash
+pipx install pre-commit
+pre-commit install
+```
+
+The configured hooks run:
+
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
+
+GitHub Actions workflows are included:
+
+- `.github/workflows/ci.yml` for formatting, linting, and tests
+- `.github/workflows/publish.yml` for dry-run or real crates.io publishing
+
+## Publishing
+
+The repository is prepared for `cargo install transession` once the crate is published.
+
+What you need to do before the real publish:
+
+1. Create a crates.io API token with publish permission.
+2. Add that token to the GitHub repository secrets as `CARGO_REGISTRY_TOKEN`.
+3. Make sure the version in `Cargo.toml` is the version you want to release.
+4. Push the release commit to `master`.
+
+How to run the publish workflow:
+
+- For a dry run in GitHub Actions: open the `publish` workflow and run `workflow_dispatch` with `dry_run=true`.
+- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.0`.
+
+The publish workflow will:
+
+- verify formatting
+- run clippy with `-D warnings`
+- run tests
+- verify that a pushed `vX.Y.Z` tag matches the `Cargo.toml` version
+- run `cargo publish --locked`
+
+The crate name `transession` appeared available during the latest local check, and `cargo publish --dry-run` succeeded locally. You should still treat name availability as time-sensitive until the first real publish completes.
+
 ## Advanced Usage
 
-There is also a portable intermediate representation for debugging and advanced workflows, but it is not the main interface.
+There is also a portable intermediate representation for debugging and advanced workflows, but it is intentionally not the main interface.
 
 Advanced commands remain available:
 
