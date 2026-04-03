@@ -70,7 +70,9 @@ transession --from claude --to codex <SESSION_ID> --output ./tmp/codex-home
 transession --from codex --to claude <SESSION_ID> --output ./tmp/claude-home
 ```
 
-When opening after translation, `transession` launches the target CLI with the translated session id. For custom output roots, it also sets `CODEX_HOME` or `CLAUDE_HOME` for the launched process.
+When opening after translation, `transession` launches the target CLI with the translated session id. For custom output roots, it sets `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude.
+
+For Codex custom output roots, `transession` also links the installed `auth.json` into the target home when needed so the launched Codex process can authenticate immediately.
 
 ## Session Lookup
 
@@ -82,7 +84,7 @@ For Codex and Claude inputs, `transession` accepts either:
 By default it searches:
 
 - Codex: `TRANSESSION_CODEX_HOME`, then `CODEX_HOME`, then `~/.codex`
-- Claude: `TRANSESSION_CLAUDE_HOME`, then `CLAUDE_HOME`, then `~/.claude`
+- Claude: `TRANSESSION_CLAUDE_HOME`, then `CLAUDE_CONFIG_DIR`, then `CLAUDE_HOME`, then `~/.claude`
 
 That means you can usually use the same id you would pass to `codex resume` or `claude -r`.
 
@@ -154,7 +156,7 @@ What you need to do before the real publish:
 How to run the publish workflow:
 
 - For a dry run in GitHub Actions: open the `publish` workflow and run `workflow_dispatch` with `dry_run=true`.
-- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.0`.
+- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.2`.
 
 The publish workflow will:
 

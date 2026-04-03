@@ -43,6 +43,38 @@ fn detects_and_imports_codex_fixture() {
 }
 
 #[test]
+fn detects_and_imports_current_codex_fixture() {
+    let path = fixture("codex_current_sample.jsonl");
+    let format = detect_format(&path).unwrap();
+    assert_eq!(format, SessionFormat::Codex);
+
+    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    assert_eq!(
+        session.metadata.session_id,
+        "019d5294-7fd5-7e21-bcca-32362218c185"
+    );
+    assert_eq!(session.metadata.model.as_deref(), Some("openai"));
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Reasoning(_)))
+    );
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ToolCall(_)))
+    );
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ToolResult(_)))
+    );
+}
+
+#[test]
 fn detects_and_imports_claude_fixture() {
     let path = fixture("claude_sample.jsonl");
     let format = detect_format(&path).unwrap();
@@ -67,6 +99,32 @@ fn detects_and_imports_claude_fixture() {
     );
     assert!(matches!(session.events[1], SessionEvent::Reasoning(_)));
     assert!(matches!(session.events[2], SessionEvent::Message(_)));
+}
+
+#[test]
+fn detects_and_imports_current_claude_fixture() {
+    let path = fixture("claude_current_sample.jsonl");
+    let format = detect_format(&path).unwrap();
+    assert_eq!(format, SessionFormat::Claude);
+
+    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    assert_eq!(
+        session.metadata.session_id,
+        "63679569-7045-45ba-bfef-cad8b1045769"
+    );
+    assert_eq!(session.metadata.platform_version.as_deref(), Some("2.1.91"));
+    assert!(
+        session
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Reasoning(_)))
+    );
+    let message_count = session
+        .events
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::Message(_)))
+        .count();
+    assert_eq!(message_count, 2);
 }
 
 #[test]
@@ -400,6 +458,29 @@ fn resolves_claude_session_ids_from_default_store_roots() {
 }
 
 #[test]
+fn resolves_claude_session_ids_from_claude_config_dir_root() {
+    let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let temp = tempdir().unwrap();
+    materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("inspect")
+        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .arg("--from")
+        .arg("claude")
+        .arg("--json")
+        .env_remove("TRANSESSION_CLAUDE_HOME")
+        .env_remove("CLAUDE_HOME")
+        .env("CLAUDE_CONFIG_DIR", temp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"detected_format\": \"claude\""));
+}
+
+#[test]
 fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
     let source_session =
         load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
@@ -423,6 +504,104 @@ fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("created codex session:"));
     assert!(stdout.contains("resume with: codex resume "));
+}
+
+#[test]
+fn quick_cli_opens_claude_target_by_default() {
+    let mut source_session =
+        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+
+    let log_path = target_home.path().join("launcher.log");
+    let script_path = target_home.path().join("fake-claude.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CLAUDE_CONFIG_DIR=%s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"{}\"\nprintf 'CLAUDE_HOME=%s\\n' \"$CLAUDE_HOME\" >> \"{}\"\n",
+            log_path.display(),
+            log_path.display(),
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("codex")
+        .arg("--to")
+        .arg("claude")
+        .arg("--keep-session-id")
+        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .arg("--output")
+        .arg(target_home.path())
+        .env("TRANSESSION_CODEX_HOME", source_home.path())
+        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("-r"));
+    assert!(log.contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"));
+    assert!(log.contains("CLAUDE_CONFIG_DIR="));
+    assert!(log.contains("CLAUDE_HOME="));
+}
+
+#[test]
+fn quick_cli_opens_codex_target_by_default_bootstraps_auth() {
+    let mut source_session =
+        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    let installed_home = tempdir().unwrap();
+    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
+    fs::write(
+        installed_home.path().join("auth.json"),
+        "{\"access_token\":\"test\"}",
+    )
+    .unwrap();
+
+    let log_path = target_home.path().join("launcher.log");
+    let script_path = target_home.path().join("fake-codex.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nif [ ! -e \"$CODEX_HOME/auth.json\" ]; then\n  echo 'missing auth' >&2\n  exit 1\nfi\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CODEX_HOME=%s\\n' \"$CODEX_HOME\" >> \"{}\"\n",
+            log_path.display(),
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("claude")
+        .arg("--to")
+        .arg("codex")
+        .arg("--keep-session-id")
+        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .arg("--output")
+        .arg(target_home.path())
+        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
+        .env("CODEX_HOME", installed_home.path())
+        .env("TRANSESSION_CODEX_BIN", &script_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("resume"));
+    assert!(log.contains("d89e26cd-11f2-47e8-bea5-a73ad5458483"));
 }
 
 #[test]

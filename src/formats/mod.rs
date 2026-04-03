@@ -199,19 +199,25 @@ fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
 }
 
 fn codex_root() -> Result<PathBuf> {
-    discover_root("TRANSESSION_CODEX_HOME", "CODEX_HOME", ".codex")
+    discover_root("TRANSESSION_CODEX_HOME", &["CODEX_HOME"], ".codex")
 }
 
 fn claude_root() -> Result<PathBuf> {
-    discover_root("TRANSESSION_CLAUDE_HOME", "CLAUDE_HOME", ".claude")
+    discover_root(
+        "TRANSESSION_CLAUDE_HOME",
+        &["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"],
+        ".claude",
+    )
 }
 
-fn discover_root(primary_env: &str, secondary_env: &str, suffix: &str) -> Result<PathBuf> {
+fn discover_root(primary_env: &str, secondary_envs: &[&str], suffix: &str) -> Result<PathBuf> {
     if let Some(path) = env_path(primary_env) {
         return Ok(path);
     }
-    if let Some(path) = env_path(secondary_env) {
-        return Ok(path);
+    for env_name in secondary_envs {
+        if let Some(path) = env_path(env_name) {
+            return Ok(path);
+        }
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(suffix))

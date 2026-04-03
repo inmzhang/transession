@@ -1,0 +1,11 @@
+{"timestamp":"2026-04-03T09:03:14.241Z","type":"session_meta","payload":{"id":"019d5294-7fd5-7e21-bcca-32362218c185","timestamp":"2026-04-03T09:02:37.028Z","cwd":"/home/inm/open-source-project/ticket","originator":"codex-tui","cli_version":"0.118.0","source":"cli","model_provider":"openai","base_instructions":{"text":"You are Codex, a coding agent based on GPT-5."}}}
+{"timestamp":"2026-04-03T09:03:14.241Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019d5295-113d-7150-bd7d-f33eea41347b","model_context_window":950000,"collaboration_mode_kind":"default"}}
+{"timestamp":"2026-04-03T09:03:14.241Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Project instructions apply."}]}}
+{"timestamp":"2026-04-03T09:03:14.241Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2026-04-03T09:03:14.241Z","type":"turn_context","payload":{"turn_id":"019d5295-113d-7150-bd7d-f33eea41347b","cwd":"/home/inm/open-source-project/ticket","current_date":"2026-04-03","timezone":"Asia/Shanghai","approval_policy":"on-request","sandbox_policy":{"type":"danger-full-access"},"model":"gpt-5.4","personality":"pragmatic","collaboration_mode":{"mode":"default","settings":{"model":"gpt-5.4","reasoning_effort":"xhigh"}},"user_instructions":"Project instructions apply."}}
+{"timestamp":"2026-04-03T09:03:15.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Thinking through the request."}]}}
+{"timestamp":"2026-04-03T09:03:16.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi there."}]}}
+{"timestamp":"2026-04-03T09:03:17.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_123","name":"read_file","call_id":"call_123","arguments":"{\"path\":\"README.md\"}"}}
+{"timestamp":"2026-04-03T09:03:18.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_123","output":"README.md"}}
+{"timestamp":"2026-04-03T09:03:19.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"2026-04-03T09:03:20.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019d5295-113d-7150-bd7d-f33eea41347b","last_agent_message":"Hi there."}}

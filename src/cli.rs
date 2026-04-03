@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -304,6 +305,8 @@ fn resume_command(
     output_root: &std::path::Path,
     session_cwd: Option<&std::path::Path>,
 ) -> Result<ProcessCommand> {
+    prepare_runtime_home(format, output_root)?;
+
     let mut command = match format {
         SessionFormat::Codex => {
             let mut cmd = ProcessCommand::new(codex_binary());
@@ -328,6 +331,7 @@ fn resume_command(
             command.env("CODEX_HOME", output_root);
         }
         SessionFormat::Claude => {
+            command.env("CLAUDE_CONFIG_DIR", output_root);
             command.env("CLAUDE_HOME", output_root);
         }
         SessionFormat::Ir => {}
@@ -346,4 +350,72 @@ fn codex_binary() -> String {
 
 fn claude_binary() -> String {
     std::env::var("TRANSESSION_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
+fn prepare_runtime_home(format: SessionFormat, output_root: &Path) -> Result<()> {
+    match format {
+        SessionFormat::Codex => bootstrap_codex_auth(output_root),
+        SessionFormat::Claude | SessionFormat::Ir => Ok(()),
+    }
+}
+
+fn bootstrap_codex_auth(output_root: &Path) -> Result<()> {
+    let installed_home = installed_codex_home()?;
+    if same_path(&installed_home, output_root) {
+        return Ok(());
+    }
+
+    let source_auth = installed_home.join("auth.json");
+    if !source_auth.is_file() {
+        return Ok(());
+    }
+
+    let target_auth = output_root.join("auth.json");
+    if target_auth.exists() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&source_auth, &target_auth).with_context(|| {
+            format!(
+                "failed to link Codex auth from {} to {}",
+                source_auth.display(),
+                target_auth.display()
+            )
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::copy(&source_auth, &target_auth).with_context(|| {
+            format!(
+                "failed to copy Codex auth from {} to {}",
+                source_auth.display(),
+                target_auth.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn installed_codex_home() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
+fn same_path(lhs: &Path, rhs: &Path) -> bool {
+    if lhs == rhs {
+        return true;
+    }
+
+    match (fs::canonicalize(lhs), fs::canonicalize(rhs)) {
+        (Ok(lhs), Ok(rhs)) => lhs == rhs,
+        _ => false,
+    }
 }
