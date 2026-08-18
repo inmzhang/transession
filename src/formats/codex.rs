@@ -249,17 +249,41 @@ fn import_response_item(
 // Failure Detection
 // ==============================================================================
 
-// Codex has no `is_error` flag on a tool result: its shell tools state the
-// outcome in the first line of their own output, and the structured envelope
-// carries the process exit code. Claude does have the flag and renders failed
-// results differently, so it is worth recovering.
+// Codex has no `is_error` flag on a tool result. Its tools report failure in
+// their own output instead, three different ways: a machine-readable field in
+// a JSON envelope, a status line the shell tools lead with, or plain prose.
+// Claude does have the flag and renders failed results differently, so it is
+// worth recovering all three.
 //
-// ponytail: only these three conventions are recognised. Free-form failures
-// ("apply_patch verification failed: ...", "collab spawn failed: ...") are left
-// as successes rather than growing a list of prose prefixes to match.
+// The wordings below come from surveying ~2400 local Codex sessions (~272k tool
+// results). New releases will invent new phrasings, and an unrecognised one
+// imports as a success -- the safe direction, since a false failure would
+// mislabel work that actually succeeded.
 
-/// Codex output is either a plain string, or a list of content blocks whose
-/// first text block holds the status line.
+/// Free-form failure openers, matched against the first line only. Ordered by
+/// how often they occur in practice.
+const FAILURE_PREFIXES: [&str; 15] = [
+    "apply_patch verification failed:",
+    "collab spawn failed:",
+    "Script terminated",
+    "execution error:",
+    "aborted by user after",
+    "timeout_ms must be at least",
+    "failed to parse function arguments:",
+    "collab tool failed:",
+    "Internal Error",
+    "resources/read failed:",
+    "unable to locate image at",
+    "unable to process image at",
+    "invalid agent id",
+    "<tool_use_error>",
+    // The freeform exec tool's own verdict; its success twin is
+    // `Script completed`, which must keep importing as a success.
+    "Script failed",
+];
+
+/// Codex output is either a plain string or a list of content blocks, in which
+/// case the first text block carries the status line.
 fn output_is_error(output: &Value) -> bool {
     match output {
         Value::String(text) => text_reports_failure(text),
@@ -272,24 +296,42 @@ fn output_is_error(output: &Value) -> bool {
 }
 
 fn text_reports_failure(text: &str) -> bool {
-    // Some tools wrap their result as `{"metadata": {"exit_code": N, ...}, ...}`,
-    // which states the outcome outright.
-    if let Ok(value) = serde_json::from_str::<Value>(text)
-        && let Some(exit_code) = value
+    // Envelopes state the outcome outright. Tool output runs to megabytes, so
+    // only pay for the parse when the text can actually be an object.
+    if text.trim_start().starts_with('{')
+        && let Ok(value) = serde_json::from_str::<Value>(text)
+    {
+        if let Some(exit_code) = value
             .get("metadata")
             .and_then(|metadata| metadata.get("exit_code"))
             .and_then(Value::as_i64)
+        {
+            return exit_code != 0;
+        }
+        // The wait/status tools report a timeout as a boolean instead.
+        if let Some(timed_out) = value.get("timed_out").and_then(Value::as_bool) {
+            return timed_out;
+        }
+    }
+
+    let first_line = text.lines().next().unwrap_or_default().trim();
+
+    // The shell tool leads with the process exit code, with or without a colon.
+    if let Some(rest) = first_line.strip_prefix("Exit code")
+        && let Ok(exit_code) = rest.trim_start_matches(':').trim().parse::<i64>()
     {
         return exit_code != 0;
     }
 
-    // Otherwise the first line is `Exit code: N` or `Script completed`/
-    // `Script failed`, depending on which shell tool ran.
-    let first_line = text.lines().next().unwrap_or_default().trim();
-    match first_line.strip_prefix("Exit code:") {
-        Some(code) => code.trim().parse::<i64>().is_ok_and(|code| code != 0),
-        None => first_line == "Script failed",
+    // The LSP tool names the server between its subject and its verdict, so no
+    // prefix can express it.
+    if first_line.starts_with("LSP server ") && first_line.contains("timed out") {
+        return true;
     }
+
+    FAILURE_PREFIXES
+        .iter()
+        .any(|prefix| first_line.starts_with(prefix))
 }
 
 fn string_field(payload: &Map<String, Value>, key: &str) -> String {
@@ -845,36 +887,75 @@ mod tests {
     use super::output_is_error;
     use serde_json::json;
 
+    fn blocks(text: &str) -> serde_json::Value {
+        json!([{ "type": "input_text", "text": text }])
+    }
+
     #[test]
-    fn reads_failure_out_of_codex_tool_output() {
-        // `Exit code: N` from the shell tool.
+    fn reads_the_exit_code_conventions() {
         assert!(!output_is_error(&json!(
             "Exit code: 0\nWall time: 0.1 seconds"
         )));
         assert!(output_is_error(&json!(
             "Exit code: 127\nWall time: 0.1 seconds"
         )));
+        // Some tools omit the colon.
+        assert!(output_is_error(&json!("Exit code 2")));
 
-        // `Script completed` / `Script failed` from the freeform exec tool.
-        let block = |text| json!([{ "type": "input_text", "text": text }]);
-        assert!(!output_is_error(&block(
+        assert!(!output_is_error(&blocks(
             "Script completed\nWall time 0.0 seconds"
         )));
-        assert!(output_is_error(&block(
+        assert!(output_is_error(&blocks(
             "Script failed\nWall time 0.0 seconds"
         )));
 
-        // The structured envelope states the exit code outright.
         assert!(!output_is_error(&json!(
             r#"{"metadata":{"exit_code":0,"duration_seconds":0.0},"output":"done"}"#
         )));
         assert!(output_is_error(&json!(
             r#"{"metadata":{"exit_code":2,"duration_seconds":0.0},"output":"nope"}"#
         )));
+    }
 
-        // Output with no status line of its own is not a failure.
-        assert!(!output_is_error(&block("README.md contents")));
-        assert!(!output_is_error(&json!("Plan updated")));
-        assert!(!output_is_error(&json!({ "unexpected": true })));
+    #[test]
+    fn reads_the_free_form_failures() {
+        for text in [
+            "apply_patch verification failed: Failed to find expected lines",
+            "collab spawn failed: agent thread limit reached",
+            "collab tool failed: agent thread limit reached",
+            "execution error: Sandbox(Signal(6))",
+            "aborted by user after 27.2s",
+            "Script terminated",
+            "timeout_ms must be at least 10000",
+            "failed to parse function arguments: missing field `cell_id`",
+            "Internal Error ()",
+            "resources/read failed: unknown MCP server 'memory'",
+            "unable to locate image at `/tmp/plot.png`",
+            "unable to process image at `/tmp/plot.png`",
+            "invalid agent id agent: Error(ParseChar { character: 'g' })",
+            "<tool_use_error>Blocked: sleep 5",
+            "LSP server `rust-analyzer` timed out after 5s during initialization",
+            r#"{"message":"Wait timed out.","timed_out":true}"#,
+        ] {
+            assert!(output_is_error(&json!(text)), "missed failure: {text}");
+        }
+    }
+
+    #[test]
+    fn leaves_ordinary_output_alone() {
+        for text in [
+            "README.md contents",
+            "Plan updated",
+            "Script running with cell ID 205",
+            // Agent transcripts quote verdicts that merely contain "FAIL".
+            r#"{"previous_status":{"completed":"VERDICT: FAIL\n- FINDINGS"}}"#,
+            r#"{"message":"Wait completed.","timed_out":false}"#,
+            // A paper title, not a tool failure.
+            "Improved Methods for Determining Quantum Error Correcting Codes",
+            "",
+        ] {
+            assert!(!output_is_error(&json!(text)), "false failure: {text}");
+            assert!(!output_is_error(&blocks(text)), "false failure: {text}");
+        }
     }
 }
