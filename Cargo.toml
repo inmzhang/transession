@@ -1,6 +1,6 @@
 [package]
 name = "transession"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 description = "Translate interactive session history between Codex, Claude Code, and a portable IR"
