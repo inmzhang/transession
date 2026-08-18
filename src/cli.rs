@@ -309,12 +309,12 @@ fn resume_command(
 
     let mut command = match format {
         SessionFormat::Codex => {
-            let mut cmd = ProcessCommand::new(codex_binary());
+            let mut cmd = ProcessCommand::new(formats::codex_binary());
             cmd.arg("resume").arg(session_id);
             cmd
         }
         SessionFormat::Claude => {
-            let mut cmd = ProcessCommand::new(claude_binary());
+            let mut cmd = ProcessCommand::new(formats::claude_binary());
             cmd.arg("-r").arg(session_id);
             cmd
         }
@@ -326,15 +326,22 @@ fn resume_command(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    match format {
-        SessionFormat::Codex => {
-            command.env("CODEX_HOME", output_root);
+    // Only redirect the target CLI's home when we wrote somewhere other than
+    // its own store. `CLAUDE_CONFIG_DIR` in particular moves the account file
+    // from `~/.claude.json` to `<dir>/.claude.json`, so pointing it at the
+    // default `~/.claude` would hand Claude Code an empty config and force a
+    // fresh login.
+    if !same_path(&installed_home(format)?, output_root) {
+        match format {
+            SessionFormat::Codex => {
+                command.env("CODEX_HOME", output_root);
+            }
+            SessionFormat::Claude => {
+                command.env("CLAUDE_CONFIG_DIR", output_root);
+                command.env("CLAUDE_HOME", output_root);
+            }
+            SessionFormat::Ir => {}
         }
-        SessionFormat::Claude => {
-            command.env("CLAUDE_CONFIG_DIR", output_root);
-            command.env("CLAUDE_HOME", output_root);
-        }
-        SessionFormat::Ir => {}
     }
 
     if let Some(cwd) = session_cwd.filter(|cwd| cwd.is_dir()) {
@@ -344,55 +351,56 @@ fn resume_command(
     Ok(command)
 }
 
-fn codex_binary() -> String {
-    std::env::var("TRANSESSION_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
-}
-
-fn claude_binary() -> String {
-    std::env::var("TRANSESSION_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
-}
-
+/// Custom output roots start out empty, so the launched CLI would ask the user
+/// to log in again. Link the installed credentials across instead.
+///
+/// Claude Code needs both files: `.credentials.json` holds the tokens and
+/// `.claude.json` holds the account record it checks before onboarding. They
+/// are linked rather than copied so a token refresh in the temporary home stays
+/// valid in the installed one; the trade-off is that the temporary home also
+/// writes its project state back into the installed config.
 fn prepare_runtime_home(format: SessionFormat, output_root: &Path) -> Result<()> {
-    match format {
-        SessionFormat::Codex => bootstrap_codex_auth(output_root),
-        SessionFormat::Claude | SessionFormat::Ir => Ok(()),
-    }
-}
+    let files: &[&str] = match format {
+        SessionFormat::Codex => &["auth.json"],
+        SessionFormat::Claude => &[".credentials.json", ".claude.json"],
+        SessionFormat::Ir => return Ok(()),
+    };
 
-fn bootstrap_codex_auth(output_root: &Path) -> Result<()> {
-    let installed_home = installed_codex_home()?;
+    let installed_home = installed_home(format)?;
     if same_path(&installed_home, output_root) {
         return Ok(());
     }
 
-    let source_auth = installed_home.join("auth.json");
-    if !source_auth.is_file() {
-        return Ok(());
+    for file in files {
+        link_runtime_file(&installed_home.join(file), &output_root.join(file))?;
     }
 
-    let target_auth = output_root.join("auth.json");
-    if target_auth.exists() {
+    Ok(())
+}
+
+fn link_runtime_file(source: &Path, target: &Path) -> Result<()> {
+    if !source.is_file() || target.exists() {
         return Ok(());
     }
 
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&source_auth, &target_auth).with_context(|| {
+        std::os::unix::fs::symlink(source, target).with_context(|| {
             format!(
-                "failed to link Codex auth from {} to {}",
-                source_auth.display(),
-                target_auth.display()
+                "failed to link {} to {}",
+                source.display(),
+                target.display()
             )
         })?;
     }
 
     #[cfg(not(unix))]
     {
-        fs::copy(&source_auth, &target_auth).with_context(|| {
+        fs::copy(source, target).with_context(|| {
             format!(
-                "failed to copy Codex auth from {} to {}",
-                source_auth.display(),
-                target_auth.display()
+                "failed to copy {} to {}",
+                source.display(),
+                target.display()
             )
         })?;
     }
@@ -400,13 +408,12 @@ fn bootstrap_codex_auth(output_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn installed_codex_home() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("CODEX_HOME") {
-        return Ok(PathBuf::from(path));
+fn installed_home(format: SessionFormat) -> Result<PathBuf> {
+    match format {
+        SessionFormat::Codex => formats::codex_root(),
+        SessionFormat::Claude => formats::claude_root(),
+        SessionFormat::Ir => bail!("IR has no runtime home"),
     }
-
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".codex"))
 }
 
 fn same_path(lhs: &Path, rhs: &Path) -> bool {

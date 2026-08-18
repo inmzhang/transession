@@ -10,6 +10,15 @@ use transession::ir::{
     UniversalSession,
 };
 
+fn is_semver(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() >= 3
+        && parts
+            .iter()
+            .take(3)
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -60,12 +69,13 @@ fn detects_and_imports_current_codex_fixture() {
             .extra
             .get("codex_model_provider")
             .and_then(|value| value.as_str()),
-        Some("OpenAI")
+        Some("openai")
     );
     assert_eq!(
         session.metadata.platform_version.as_deref(),
-        Some("0.144.6")
+        Some("0.147.0")
     );
+    assert_eq!(session.metadata.git_branch.as_deref(), Some("main"));
     assert!(
         session
             .events
@@ -129,7 +139,7 @@ fn detects_and_imports_current_claude_fixture() {
     );
     assert_eq!(
         session.metadata.platform_version.as_deref(),
-        Some("2.1.215")
+        Some("2.1.234")
     );
     assert_eq!(session.metadata.model.as_deref(), Some("claude-opus-4.8"));
     assert!(
@@ -224,7 +234,27 @@ fn materializes_canonical_codex_layout() {
     let text = fs::read_to_string(path).unwrap();
     assert!(text.contains("\"type\":\"input_image\""));
     assert!(text.contains("\"name\":\"Read\""));
-    assert!(text.contains("\"cli_version\":\"0.144.6\""));
+    let session_meta =
+        serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        session_meta
+            .get("payload")
+            .and_then(|payload| payload.get("git"))
+            .and_then(|git| git.get("branch"))
+            .and_then(|value| value.as_str()),
+        Some("main")
+    );
+    let cli_version = serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap())
+        .unwrap()
+        .get("payload")
+        .and_then(|payload| payload.get("cli_version"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap();
+    assert!(
+        is_semver(&cli_version),
+        "unexpected cli_version {cli_version}"
+    );
 }
 
 #[test]
@@ -349,14 +379,14 @@ fn materialized_codex_sessions_include_turn_events() {
             .get("payload")
             .and_then(|value| value.get("model_provider"))
             .and_then(|value| value.as_str()),
-        Some("OpenAI")
+        Some("openai")
     );
-    assert_eq!(
+    assert!(
         session_meta
             .get("payload")
             .and_then(|value| value.get("cli_version"))
-            .and_then(|value| value.as_str()),
-        Some("0.144.6")
+            .and_then(|value| value.as_str())
+            .is_some_and(is_semver)
     );
     assert_eq!(
         session_meta
@@ -423,9 +453,11 @@ fn materializes_canonical_claude_layout() {
     let mut saw_structured_tool_result = false;
     for line in text.lines() {
         let value: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(
-            value.get("version").and_then(|value| value.as_str()),
-            Some("2.1.215")
+        assert!(
+            value
+                .get("version")
+                .and_then(|value| value.as_str())
+                .is_some_and(is_semver)
         );
         assert_eq!(
             value.get("entrypoint").and_then(|value| value.as_str()),
@@ -660,8 +692,112 @@ fn quick_cli_opens_claude_target_by_default() {
     let log = fs::read_to_string(log_path).unwrap();
     assert!(log.contains("-r"));
     assert!(log.contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"));
-    assert!(log.contains("CLAUDE_CONFIG_DIR="));
-    assert!(log.contains("CLAUDE_HOME="));
+    assert!(log.contains(&format!(
+        "CLAUDE_CONFIG_DIR={}",
+        target_home.path().display()
+    )));
+    assert!(log.contains(&format!("CLAUDE_HOME={}", target_home.path().display())));
+}
+
+#[test]
+fn quick_cli_opens_claude_in_installed_home_without_config_override() {
+    let mut source_session =
+        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let source_home = tempdir().unwrap();
+    let claude_home = tempdir().unwrap();
+    source_session.metadata.cwd = Some(claude_home.path().join("missing-session-cwd"));
+    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+
+    let log_path = claude_home.path().join("launcher.log");
+    let script_path = claude_home.path().join("fake-claude.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nprintf 'CLAUDE_CONFIG_DIR=%s\\n' \"$CLAUDE_CONFIG_DIR\" > \"{}\"\nprintf 'CLAUDE_HOME=%s\\n' \"$CLAUDE_HOME\" >> \"{}\"\n",
+            log_path.display(),
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("codex")
+        .arg("--to")
+        .arg("claude")
+        .arg("--keep-session-id")
+        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .arg("--output")
+        .arg(claude_home.path())
+        .env("TRANSESSION_CODEX_HOME", source_home.path())
+        .env("TRANSESSION_CLAUDE_HOME", claude_home.path())
+        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    // Claude Code keeps its account record in `<CLAUDE_CONFIG_DIR>/.claude.json`,
+    // so overriding the variable with the store we just wrote into would send
+    // the user through login again.
+    let log = fs::read_to_string(log_path).unwrap();
+    assert_eq!(log, "CLAUDE_CONFIG_DIR=\nCLAUDE_HOME=\n");
+}
+
+#[test]
+fn quick_cli_opens_claude_target_bootstraps_login_state() {
+    let mut source_session =
+        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let source_home = tempdir().unwrap();
+    let target_home = tempdir().unwrap();
+    let installed_home = tempdir().unwrap();
+    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+    fs::write(
+        installed_home.path().join(".credentials.json"),
+        "{\"claudeAiOauth\":{}}",
+    )
+    .unwrap();
+    fs::write(
+        installed_home.path().join(".claude.json"),
+        "{\"oauthAccount\":{}}",
+    )
+    .unwrap();
+
+    let log_path = target_home.path().join("launcher.log");
+    let script_path = target_home.path().join("fake-claude.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nfor file in .credentials.json .claude.json; do\n  if [ ! -e \"$CLAUDE_CONFIG_DIR/$file\" ]; then\n    echo \"missing $file\" >&2\n    exit 1\n  fi\ndone\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+            log_path.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+        .arg("--from")
+        .arg("codex")
+        .arg("--to")
+        .arg("claude")
+        .arg("--keep-session-id")
+        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .arg("--output")
+        .arg(target_home.path())
+        .env("TRANSESSION_CODEX_HOME", source_home.path())
+        .env("TRANSESSION_CLAUDE_HOME", installed_home.path())
+        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"));
 }
 
 #[test]

@@ -14,8 +14,9 @@ use crate::ir::{
     ToolCallEvent, ToolResultEvent, UniversalSession,
 };
 
-const CODEX_CLI_VERSION: &str = "0.144.6";
-const CODEX_MODEL_PROVIDER: &str = "OpenAI";
+// Codex 0.147 writes the provider id in lowercase; the state DB and the resume
+// picker compare it verbatim, so match that spelling.
+const CODEX_MODEL_PROVIDER: &str = "openai";
 
 pub struct CodexMaterialization {
     pub session_file: PathBuf,
@@ -116,6 +117,16 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
             "codex_base_instructions".to_string(),
             base_instructions.clone(),
         );
+    }
+
+    // Codex 0.147 records the repository state in session_meta. Keeping the
+    // whole block lets us re-export it verbatim, while the branch also feeds
+    // the Claude `gitBranch` field and the Codex picker column.
+    if let Some(git) = payload.get("git") {
+        if let Some(branch) = git.get("branch").and_then(Value::as_str) {
+            metadata.git_branch = Some(branch.to_string());
+        }
+        metadata.extra.insert("codex_git".to_string(), git.clone());
     }
 }
 
@@ -387,7 +398,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .unwrap_or_else(|| "transession".to_string())
             .into(),
     );
-    session_meta_payload.insert("cli_version".to_string(), CODEX_CLI_VERSION.into());
+    session_meta_payload.insert("cli_version".to_string(), super::codex_cli_version().into());
     session_meta_payload.insert(
         "source".to_string(),
         session
@@ -408,6 +419,9 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             "base_instructions".to_string(),
             json!({ "text": base_instructions }),
         );
+    }
+    if let Some(git) = codex_git_info(&session.metadata) {
+        session_meta_payload.insert("git".to_string(), git);
     }
 
     write_json_line(
@@ -745,6 +759,19 @@ fn copy_if_present(
     }
 }
 
+/// Rebuild the `git` block for an exported session.
+///
+/// An imported Codex session carries the original block; sessions arriving from
+/// Claude only know the branch name, which is still enough for the resume
+/// picker's branch column.
+fn codex_git_info(metadata: &SessionMetadata) -> Option<Value> {
+    match (metadata.extra.get("codex_git"), &metadata.git_branch) {
+        (Some(git), _) => Some(git.clone()),
+        (None, Some(branch)) => Some(json!({ "branch": branch })),
+        (None, None) => None,
+    }
+}
+
 fn extra_string(metadata: &SessionMetadata, key: &str) -> Option<String> {
     metadata
         .extra
@@ -1020,7 +1047,7 @@ fn register_thread_in_sqlite(
                 approval_mode,
                 has_user_event,
                 git_branch,
-                CODEX_CLI_VERSION,
+                super::codex_cli_version(),
                 first_user_message,
             ],
         )

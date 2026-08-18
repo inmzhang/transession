@@ -3,6 +3,8 @@ mod codex;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -198,11 +200,11 @@ fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
     })
 }
 
-fn codex_root() -> Result<PathBuf> {
+pub(crate) fn codex_root() -> Result<PathBuf> {
     discover_root("TRANSESSION_CODEX_HOME", &["CODEX_HOME"], ".codex")
 }
 
-fn claude_root() -> Result<PathBuf> {
+pub(crate) fn claude_root() -> Result<PathBuf> {
     discover_root(
         "TRANSESSION_CLAUDE_HOME",
         &["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"],
@@ -227,6 +229,69 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
+// ==============================================================================
+// Target CLI Versions
+// ==============================================================================
+
+// Both stores stamp the writing CLI version into every record, and both CLIs
+// use it to decide how to read a session back. Hardcoding a version means the
+// translated session claims to come from whatever release we last tested
+// against, so we ask the installed CLI instead and keep the constants only as
+// a fallback for machines where the other tool is not installed (CI, for
+// example).
+
+const CODEX_CLI_VERSION_FALLBACK: &str = "0.147.0";
+const CLAUDE_CODE_VERSION_FALLBACK: &str = "2.1.234";
+
+pub(crate) fn codex_binary() -> String {
+    std::env::var("TRANSESSION_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+}
+
+pub(crate) fn claude_binary() -> String {
+    std::env::var("TRANSESSION_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+}
+
+pub(crate) fn codex_cli_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| detect_cli_version(&codex_binary(), CODEX_CLI_VERSION_FALLBACK))
+}
+
+pub(crate) fn claude_cli_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| detect_cli_version(&claude_binary(), CLAUDE_CODE_VERSION_FALLBACK))
+}
+
+fn detect_cli_version(binary: &str, fallback: &str) -> String {
+    Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| parse_version(&text))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Pick the first `x.y.z` token out of a `--version` banner.
+///
+/// Codex prints `codex-cli 0.147.0` and Claude Code prints
+/// `2.1.234 (Claude Code)`, so trimming the decoration off each token and
+/// keeping the first numeric triple covers both.
+fn parse_version(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| !ch.is_ascii_digit()))
+        .find(|token| {
+            let mut parts = token.split('.');
+            let numeric = |part: Option<&str>| {
+                part.is_some_and(|part| {
+                    !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit())
+                })
+            };
+            numeric(parts.next()) && numeric(parts.next()) && numeric(parts.next())
+        })
+        .map(str::to_string)
+}
+
 fn find_in_tree<F>(root: &Path, predicate: F) -> Result<PathBuf>
 where
     F: Fn(&Path) -> bool + Copy,
@@ -249,4 +314,22 @@ where
     }
 
     bail!("could not find a matching session under {}", root.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+
+    #[test]
+    fn parses_installed_cli_banners() {
+        assert_eq!(
+            parse_version("codex-cli 0.147.0\n").as_deref(),
+            Some("0.147.0")
+        );
+        assert_eq!(
+            parse_version("2.1.234 (Claude Code)\n").as_deref(),
+            Some("2.1.234")
+        );
+        assert_eq!(parse_version("some unrelated output"), None);
+    }
 }

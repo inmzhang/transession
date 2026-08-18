@@ -13,8 +13,6 @@ use crate::ir::{
     ToolCallEvent, ToolResultEvent, UniversalSession,
 };
 
-const CLAUDE_CODE_VERSION: &str = "2.1.215";
-
 pub struct ClaudeMaterialization {
     pub session_file: PathBuf,
     pub history_file: Option<PathBuf>,
@@ -394,7 +392,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
             .filter_map(SessionEvent::timestamp)
             .min()
     });
-    let version = CLAUDE_CODE_VERSION;
+    let version = super::claude_cli_version();
 
     let mut file = File::create(&materialization.session_file).with_context(|| {
         format!(

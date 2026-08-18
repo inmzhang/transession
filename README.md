@@ -3,7 +3,9 @@
 `transession` translates interactive session history between Codex and Claude Code.
 
 > [!IMPORTANT]
-> **Tested compatibility (2026-07-20):** Codex CLI [`0.144.6`](https://github.com/openai/codex/releases/tag/rust-v0.144.6) and Claude Code [`2.1.215`](https://github.com/anthropics/claude-code/releases/tag/v2.1.215), in both directions. If either installed CLI is newer, its private session format is not yet verified against this version of `transession`.
+> **Tested compatibility (2026-08-18):** Codex CLI [`0.147.0`](https://github.com/openai/codex/releases/tag/rust-v0.147.0) and Claude Code [`2.1.234`](https://github.com/anthropics/claude-code/releases/tag/v2.1.234), in both directions, verified by resuming the translated session in the target CLI. If either installed CLI is newer, its private session format is not yet verified against this version of `transession`.
+
+Translated sessions are stamped with the version of the CLI installed on your machine (`codex --version`, `claude --version`), so they no longer claim to come from whatever release `transession` was last tested against. When the target CLI is not installed, the versions above are used instead.
 
 The default workflow is direct native-to-native conversion by session id:
 
@@ -73,9 +75,9 @@ transession --from claude --to codex <SESSION_ID> --output ./tmp/codex-home
 transession --from codex --to claude <SESSION_ID> --output ./tmp/claude-home
 ```
 
-When opening after translation, `transession` launches the target CLI with the translated session id. For custom output roots, it sets `CODEX_HOME` for Codex and `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude.
+When opening after translation, `transession` launches the target CLI with the translated session id. Only a custom output root redirects the target CLI's home: `CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude. Writing into the installed store leaves those variables alone, because `CLAUDE_CONFIG_DIR` also moves Claude Code's account file from `~/.claude.json` to `<dir>/.claude.json` and would otherwise force a fresh login.
 
-For Codex custom output roots, `transession` also links the installed `auth.json` into the target home when needed so the launched Codex process can authenticate immediately.
+For custom output roots, `transession` links the installed credentials into the target home when needed, so the launched CLI can authenticate immediately: `auth.json` for Codex, `.credentials.json` and `.claude.json` for Claude.
 
 ## Session Lookup
 
@@ -111,7 +113,8 @@ The current test suite covers the main happy paths, but real-world session logs 
 Known omissions:
 
 - opaque reasoning payloads and token-accounting side data
-- Codex SQLite state and shell snapshot sidecars
+- Codex's paginated `item_completed` thread items; translated sessions use the legacy event history that Codex still replays
+- Codex shell snapshot sidecars (the thread row in `state_5.sqlite` is written)
 - Claude subagent trees and tool-result sidecar directories
 - platform-specific runtime caches outside the main session log
 
