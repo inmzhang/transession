@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -14,22 +15,13 @@ pub enum SessionFormat {
     Claude,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum SourceFormat {
-    Auto,
-    Ir,
-    Codex,
-    Claude,
-}
-
-impl SourceFormat {
-    pub fn explicit(self) -> Option<SessionFormat> {
-        match self {
-            Self::Auto => None,
-            Self::Ir => Some(SessionFormat::Ir),
-            Self::Codex => Some(SessionFormat::Codex),
-            Self::Claude => Some(SessionFormat::Claude),
-        }
+impl fmt::Display for SessionFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ir => "ir",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        })
     }
 }
 
@@ -46,7 +38,10 @@ impl UniversalSession {
     pub fn new(session_id: String) -> Self {
         Self {
             ir_version: Self::CURRENT_IR_VERSION.to_string(),
-            metadata: SessionMetadata::new(session_id),
+            metadata: SessionMetadata {
+                session_id,
+                ..SessionMetadata::default()
+            },
             events: Vec::new(),
         }
     }
@@ -73,17 +68,10 @@ pub struct SessionMetadata {
     pub created_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<DateTime<Utc>>,
+    /// Fields only one platform understands, namespaced by their source (for
+    /// example `codex_sandbox_policy`) so a round trip can put them back.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra: BTreeMap<String, Value>,
-}
-
-impl SessionMetadata {
-    pub fn new(session_id: String) -> Self {
-        Self {
-            session_id,
-            ..Self::default()
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

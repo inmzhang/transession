@@ -2,17 +2,16 @@ mod claude;
 mod codex;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
-use crate::ir::{SessionFormat, SourceFormat, UniversalSession};
-
-pub use claude::ClaudeMaterialization;
-pub use codex::CodexMaterialization;
+use crate::ir::{ContentBlock, SessionEvent, SessionFormat, SessionMetadata, UniversalSession};
 
 #[derive(Debug)]
 pub struct ResolvedInput {
@@ -21,15 +20,11 @@ pub struct ResolvedInput {
 }
 
 pub fn detect_format(path: &Path) -> Result<SessionFormat> {
-    let bytes = fs::read(path).with_context(|| {
-        format!(
-            "failed to read input for format detection: {}",
-            path.display()
-        )
-    })?;
-    let text = String::from_utf8(bytes)
-        .with_context(|| format!("input is not valid UTF-8: {}", path.display()))?;
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {} for format detection", path.display()))?;
 
+    // Pretty-printed IR is the only format that spans several lines as one JSON
+    // document; everything else is JSONL, where the first line is enough.
     if let Ok(value) = serde_json::from_str::<Value>(&text)
         && value.get("ir_version").is_some()
     {
@@ -46,14 +41,9 @@ pub fn detect_format(path: &Path) -> Result<SessionFormat> {
     if value.get("ir_version").is_some() {
         return Ok(SessionFormat::Ir);
     }
-
-    if matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("session_meta")
-    ) {
+    if value.get("type").and_then(Value::as_str) == Some("session_meta") {
         return Ok(SessionFormat::Codex);
     }
-
     if value.get("sessionId").is_some() {
         return Ok(SessionFormat::Claude);
     }
@@ -61,15 +51,18 @@ pub fn detect_format(path: &Path) -> Result<SessionFormat> {
     bail!("could not detect format for {}", path.display())
 }
 
-pub fn resolve_input(path: &Path, format: SourceFormat) -> Result<ResolvedInput> {
+/// Accept either a session file path or a native session id, resolving the
+/// latter against the local Codex/Claude stores. `format` of `None` means
+/// autodetect.
+pub fn resolve_input(path: &Path, format: Option<SessionFormat>) -> Result<ResolvedInput> {
     if path.exists() {
-        let resolved_format = match format.explicit() {
+        let format = match format {
             Some(format) => format,
             None => detect_format(path)?,
         };
         return Ok(ResolvedInput {
             path: path.to_path_buf(),
-            format: resolved_format,
+            format,
         });
     }
 
@@ -78,7 +71,7 @@ pub fn resolve_input(path: &Path, format: SourceFormat) -> Result<ResolvedInput>
         bail!("input path is empty");
     }
 
-    match format.explicit() {
+    match format {
         Some(SessionFormat::Ir) => bail!(
             "IR input must be addressed by file path; session-id lookup only works for Codex and Claude"
         ),
@@ -94,35 +87,37 @@ pub fn resolve_input(path: &Path, format: SourceFormat) -> Result<ResolvedInput>
                 format: SessionFormat::Claude,
             })
         }
-        None => {
-            let codex = resolve_codex_session_id(&session_id).ok();
-            let claude = resolve_claude_session_id(&session_id).ok();
-            match (codex, claude) {
-                (Some(path), None) => Ok(ResolvedInput {
-                    path,
-                    format: SessionFormat::Codex,
-                }),
-                (None, Some(path)) => Ok(ResolvedInput {
-                    path,
-                    format: SessionFormat::Claude,
-                }),
-                (Some(_), Some(_)) => bail!(
-                    "session id {session_id} exists in both Codex and Claude stores; specify --from"
-                ),
-                (None, None) => bail!(
-                    "could not resolve {session_id} as a path or native session id in the default Codex/Claude stores"
-                ),
-            }
-        }
+        None => match (
+            resolve_codex_session_id(&session_id).ok(),
+            resolve_claude_session_id(&session_id).ok(),
+        ) {
+            (Some(path), None) => Ok(ResolvedInput {
+                path,
+                format: SessionFormat::Codex,
+            }),
+            (None, Some(path)) => Ok(ResolvedInput {
+                path,
+                format: SessionFormat::Claude,
+            }),
+            (Some(_), Some(_)) => bail!(
+                "session id {session_id} exists in both Codex and Claude stores; specify --from"
+            ),
+            (None, None) => bail!(
+                "could not resolve {session_id} as a path or native session id in the default Codex/Claude stores"
+            ),
+        },
     }
 }
 
-pub fn load_session(path: &Path, format: SourceFormat) -> Result<UniversalSession> {
-    let resolved = resolve_input(path, format)?;
-    match resolved.format {
-        SessionFormat::Ir => load_ir(&resolved.path),
-        SessionFormat::Codex => codex::load(&resolved.path),
-        SessionFormat::Claude => claude::load(&resolved.path),
+pub fn load_session(path: &Path, format: Option<SessionFormat>) -> Result<UniversalSession> {
+    load_resolved(&resolve_input(path, format)?)
+}
+
+pub fn load_resolved(input: &ResolvedInput) -> Result<UniversalSession> {
+    match input.format {
+        SessionFormat::Ir => load_ir(&input.path),
+        SessionFormat::Codex => codex::load(&input.path),
+        SessionFormat::Claude => claude::load(&input.path),
     }
 }
 
@@ -167,15 +162,9 @@ pub fn default_output_root(target: SessionFormat) -> Result<PathBuf> {
 }
 
 fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
-    let root = codex_root()?;
-    let sessions_root = root.join("sessions");
-    find_in_tree(&sessions_root, |path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.ends_with(&format!("-{session_id}.jsonl")))
-            .unwrap_or(false)
-    })
-    .with_context(|| {
+    let sessions_root = codex_root()?.join("sessions");
+    let suffix = format!("-{session_id}.jsonl");
+    find_in_tree(&sessions_root, |name| name.ends_with(&suffix)).with_context(|| {
         format!(
             "could not find Codex session {session_id} under {}",
             sessions_root.display()
@@ -184,15 +173,9 @@ fn resolve_codex_session_id(session_id: &str) -> Result<PathBuf> {
 }
 
 fn resolve_claude_session_id(session_id: &str) -> Result<PathBuf> {
-    let root = claude_root()?;
-    let projects_root = root.join("projects");
-    find_in_tree(&projects_root, |path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name == format!("{session_id}.jsonl"))
-            .unwrap_or(false)
-    })
-    .with_context(|| {
+    let projects_root = claude_root()?.join("projects");
+    let file_name = format!("{session_id}.jsonl");
+    find_in_tree(&projects_root, |name| name == file_name).with_context(|| {
         format!(
             "could not find Claude session {session_id} under {}",
             projects_root.display()
@@ -213,20 +196,37 @@ pub(crate) fn claude_root() -> Result<PathBuf> {
 }
 
 fn discover_root(primary_env: &str, secondary_envs: &[&str], suffix: &str) -> Result<PathBuf> {
-    if let Some(path) = env_path(primary_env) {
-        return Ok(path);
-    }
-    for env_name in secondary_envs {
-        if let Some(path) = env_path(env_name) {
-            return Ok(path);
+    for name in std::iter::once(&primary_env).chain(secondary_envs) {
+        if let Some(path) = std::env::var_os(name) {
+            return Ok(PathBuf::from(path));
         }
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(suffix))
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
+fn find_in_tree(root: &Path, matches: impl Fn(&str) -> bool) -> Result<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(&matches)
+            {
+                return Ok(path);
+            }
+        }
+    }
+
+    bail!("could not find a matching session under {}", root.display())
 }
 
 // ==============================================================================
@@ -292,28 +292,103 @@ fn parse_version(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn find_in_tree<F>(root: &Path, predicate: F) -> Result<PathBuf>
-where
-    F: Fn(&Path) -> bool + Copy,
-{
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+// ==============================================================================
+// Shared JSONL helpers
+// ==============================================================================
 
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if predicate(&path) {
-                return Ok(path);
-            }
-        }
+// Codex and Claude store different schemas but the same shape: one JSON object
+// per line, RFC3339 millisecond timestamps, and content blocks that carry their
+// text under one of a few well-known keys.
+
+pub(crate) fn write_json_line(file: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *file, value).context("failed to encode JSONL line")?;
+    file.write_all(b"\n").context("failed to write newline")
+}
+
+pub(crate) fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+pub(crate) fn rfc3339(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+pub(crate) fn update_time_bounds(metadata: &mut SessionMetadata, timestamp: Option<DateTime<Utc>>) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+    metadata.created_at = Some(
+        metadata
+            .created_at
+            .map_or(timestamp, |at| at.min(timestamp)),
+    );
+    metadata.updated_at = Some(
+        metadata
+            .updated_at
+            .map_or(timestamp, |at| at.max(timestamp)),
+    );
+}
+
+/// Split a stored content block into `kind` / `text` / everything else, so an
+/// export can put the extras back where they came from.
+pub(crate) fn normalize_block(value: &Value) -> ContentBlock {
+    const TEXT_KEYS: [&str; 3] = ["text", "thinking", "content"];
+
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("text")
+        .to_string();
+    let text = TEXT_KEYS
+        .iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+        .map(str::to_string);
+
+    let mut object = value.as_object().cloned().unwrap_or_default();
+    object.remove("type");
+    for key in TEXT_KEYS {
+        object.remove(key);
     }
+    let data = (!object.is_empty()).then_some(Value::Object(object));
 
-    bail!("could not find a matching session under {}", root.display())
+    ContentBlock { kind, text, data }
+}
+
+pub(crate) fn json_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// First non-empty user text, collapsed onto one short line. Both stores show
+/// it in their resume picker.
+pub(crate) fn first_user_text(session: &UniversalSession) -> Option<String> {
+    session.events.iter().find_map(|event| {
+        let SessionEvent::Message(message) = event else {
+            return None;
+        };
+        if message.role != "user" {
+            return None;
+        }
+        message
+            .blocks
+            .iter()
+            .filter_map(|block| block.text.as_deref())
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .find(|text| !text.is_empty())
+            .map(|text| text.chars().take(80).collect())
+    })
+}
+
+pub(crate) fn derive_title(session: &UniversalSession) -> Option<String> {
+    session
+        .metadata
+        .title
+        .clone()
+        .or_else(|| first_user_text(session))
 }
 
 #[cfg(test)]

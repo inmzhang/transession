@@ -1,32 +1,30 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use super::{
+    derive_title, first_user_text, json_to_string, normalize_block, parse_datetime, rfc3339,
+    update_time_bounds, write_json_line,
+};
 use crate::ir::{
     ContentBlock, MessageEvent, ReasoningEvent, SessionEvent, SessionFormat, SessionMetadata,
     ToolCallEvent, ToolResultEvent, UniversalSession,
 };
 
-pub struct ClaudeMaterialization {
-    pub session_file: PathBuf,
-    pub history_file: Option<PathBuf>,
-}
-
 pub fn load(path: &Path) -> Result<UniversalSession> {
     let file = File::open(path)
         .with_context(|| format!("failed to open Claude session {}", path.display()))?;
-    let reader = BufReader::new(file);
 
     let mut session = UniversalSession::new(Uuid::new_v4().to_string());
     session.metadata.source_format = Some(SessionFormat::Claude);
 
-    for line in reader.lines() {
+    for line in BufReader::new(file).lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
@@ -35,9 +33,12 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
         let value: Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid JSONL in {}", path.display()))?;
         import_metadata(&mut session.metadata, &value);
-        if value.get("isMeta").and_then(Value::as_bool) == Some(true)
-            || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
-        {
+
+        // `isMeta` entries are injected context rather than conversation, and
+        // sidechains are subagent transcripts the other platform has no place
+        // for.
+        let flagged = |key| value.get(key).and_then(Value::as_bool) == Some(true);
+        if flagged("isMeta") || flagged("isSidechain") {
             continue;
         }
 
@@ -49,26 +50,28 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
     }
 
     if session.metadata.title.is_none() {
-        session.metadata.title = derive_title(&session);
+        session.metadata.title = first_user_text(&session);
     }
 
     Ok(session)
 }
 
 fn import_metadata(metadata: &mut SessionMetadata, value: &Value) {
-    if let Some(session_id) = value.get("sessionId").and_then(Value::as_str) {
-        metadata.session_id = session_id.to_string();
-        metadata.original_session_id = Some(session_id.to_string());
+    let field = |key| value.get(key).and_then(Value::as_str).map(str::to_string);
+
+    if let Some(session_id) = field("sessionId") {
+        metadata.original_session_id = Some(session_id.clone());
+        metadata.session_id = session_id;
         metadata.source_format = Some(SessionFormat::Claude);
     }
-    if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+    if let Some(cwd) = field("cwd") {
         metadata.cwd = Some(PathBuf::from(cwd));
     }
-    if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-        metadata.git_branch = Some(branch.to_string());
+    if let Some(branch) = field("gitBranch") {
+        metadata.git_branch = Some(branch);
     }
-    if let Some(version) = value.get("version").and_then(Value::as_str) {
-        metadata.platform_version = Some(version.to_string());
+    if let Some(version) = field("version") {
+        metadata.platform_version = Some(version);
     }
     if let Some(model) = value
         .get("message")
@@ -77,195 +80,209 @@ fn import_metadata(metadata: &mut SessionMetadata, value: &Value) {
     {
         metadata.model = Some(model.to_string());
     }
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_datetime);
-    update_time_bounds(metadata, timestamp);
+    update_time_bounds(
+        metadata,
+        field("timestamp").as_deref().and_then(parse_datetime),
+    );
 }
 
 fn import_user_entry(events: &mut Vec<SessionEvent>, value: &Value) {
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_datetime);
-    let uuid = value
-        .get("uuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let parent_uuid = value
-        .get("parentUuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    let Some(message) = value.get("message") else {
+    let (id, parent_id, timestamp) = entry_identity(value);
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+    else {
         return;
     };
 
-    let content = message.get("content").cloned().unwrap_or(Value::Null);
     match content {
-        Value::String(text) => {
-            if text.trim().is_empty() {
-                return;
-            }
-            events.push(SessionEvent::Message(MessageEvent {
-                id: uuid,
-                parent_id: parent_uuid,
-                role: "user".to_string(),
-                timestamp,
-                blocks: vec![ContentBlock::text("text", text)],
-                metadata: BTreeMap::new(),
-            }));
-        }
+        Value::String(text) if !text.trim().is_empty() => push_user_message(
+            events,
+            vec![ContentBlock::text("text", text.clone())],
+            &id,
+            &parent_id,
+            timestamp,
+        ),
         Value::Array(items) => {
-            let mut message_blocks = Vec::new();
-
+            // Claude batches tool results into the following user turn; split
+            // them back out so the IR keeps one event per logical step.
+            let mut blocks = Vec::new();
             for item in items {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("tool_result") => {
-                        if !message_blocks.is_empty() {
-                            events.push(SessionEvent::Message(MessageEvent {
-                                id: uuid.clone(),
-                                parent_id: parent_uuid.clone(),
-                                role: "user".to_string(),
-                                timestamp,
-                                blocks: std::mem::take(&mut message_blocks),
-                                metadata: BTreeMap::new(),
-                            }));
-                        }
-
-                        import_tool_result_block(
-                            events,
-                            &item,
-                            timestamp,
-                            uuid.clone(),
-                            parent_uuid.clone(),
-                        );
-                    }
-                    _ => message_blocks.push(normalize_block(&item)),
+                if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    push_user_message(
+                        events,
+                        std::mem::take(&mut blocks),
+                        &id,
+                        &parent_id,
+                        timestamp,
+                    );
+                    events.push(SessionEvent::ToolResult(ToolResultEvent {
+                        id: id.clone(),
+                        parent_id: parent_id.clone(),
+                        call_id: item
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        timestamp,
+                        output: item.get("content").cloned().unwrap_or(Value::Null),
+                        is_error: item.get("is_error").and_then(Value::as_bool) == Some(true),
+                        metadata: BTreeMap::new(),
+                    }));
+                } else {
+                    blocks.push(normalize_block(item));
                 }
             }
-
-            if !message_blocks.is_empty() {
-                events.push(SessionEvent::Message(MessageEvent {
-                    id: uuid,
-                    parent_id: parent_uuid,
-                    role: "user".to_string(),
-                    timestamp,
-                    blocks: message_blocks,
-                    metadata: BTreeMap::new(),
-                }));
-            }
+            push_user_message(events, blocks, &id, &parent_id, timestamp);
         }
         _ => {}
     }
 }
 
+fn push_user_message(
+    events: &mut Vec<SessionEvent>,
+    blocks: Vec<ContentBlock>,
+    id: &Option<String>,
+    parent_id: &Option<String>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    events.push(SessionEvent::Message(MessageEvent {
+        id: id.clone(),
+        parent_id: parent_id.clone(),
+        role: "user".to_string(),
+        timestamp,
+        blocks,
+        metadata: BTreeMap::new(),
+    }));
+}
+
 fn import_assistant_entry(events: &mut Vec<SessionEvent>, value: &Value) {
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_datetime);
-    let uuid = value
-        .get("uuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let parent_uuid = value
-        .get("parentUuid")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let (id, parent_id, timestamp) = entry_identity(value);
     let Some(message) = value.get("message") else {
         return;
     };
-
-    let mut shared_metadata = BTreeMap::new();
-    if let Some(model) = message.get("model") {
-        shared_metadata.insert("model".to_string(), model.clone());
-    }
-    if let Some(stop_reason) = message.get("stop_reason") {
-        shared_metadata.insert("stop_reason".to_string(), stop_reason.clone());
-    }
-
-    let content = message.get("content").and_then(Value::as_array).cloned();
-    let Some(content) = content else {
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
         return;
     };
 
-    let mut message_blocks = Vec::new();
-    let mut reasoning_blocks = Vec::new();
+    let mut metadata = BTreeMap::new();
+    for key in ["model", "stop_reason"] {
+        if let Some(value) = message.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
 
-    for (index, item) in content.into_iter().enumerate() {
+    // One Claude entry can mix thinking, prose and tool calls; each kind
+    // becomes its own IR event, flushing whatever was accumulating before it.
+    let mut blocks = Vec::new();
+    let mut reasoning = Vec::new();
+
+    for (index, item) in content.iter().enumerate() {
+        let suffix = |kind| id.as_ref().map(|id| format!("{id}:{kind}:{index}"));
         match item.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
                 flush_reasoning(
                     events,
-                    &mut reasoning_blocks,
-                    uuid.clone().map(|base| format!("{base}:reasoning:{index}")),
-                    parent_uuid.clone(),
+                    &mut reasoning,
+                    suffix("reasoning"),
+                    &parent_id,
                     timestamp,
-                    &shared_metadata,
+                    &metadata,
                 );
                 flush_message(
                     events,
-                    &mut message_blocks,
-                    uuid.clone().map(|base| format!("{base}:msg:{index}")),
-                    parent_uuid.clone(),
+                    &mut blocks,
+                    suffix("msg"),
+                    &parent_id,
                     timestamp,
-                    &shared_metadata,
+                    &metadata,
                 );
-
-                import_tool_use_block(events, &item, timestamp, uuid.clone(), parent_uuid.clone());
+                events.push(SessionEvent::ToolCall(ToolCallEvent {
+                    id: id.clone(),
+                    parent_id: parent_id.clone(),
+                    call_id: item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    timestamp,
+                    arguments: item.get("input").cloned().unwrap_or(Value::Null),
+                    metadata: item
+                        .get("caller")
+                        .map(|caller| BTreeMap::from([("caller".to_string(), caller.clone())]))
+                        .unwrap_or_default(),
+                }));
             }
             Some("thinking") => {
                 flush_message(
                     events,
-                    &mut message_blocks,
-                    uuid.clone().map(|base| format!("{base}:msg:{index}")),
-                    parent_uuid.clone(),
+                    &mut blocks,
+                    suffix("msg"),
+                    &parent_id,
                     timestamp,
-                    &shared_metadata,
+                    &metadata,
                 );
                 if let Some(text) = item.get("thinking").and_then(Value::as_str) {
-                    reasoning_blocks.push(text.to_string());
+                    reasoning.push(text.to_string());
                 }
             }
             _ => {
                 flush_reasoning(
                     events,
-                    &mut reasoning_blocks,
-                    uuid.clone().map(|base| format!("{base}:reasoning:{index}")),
-                    parent_uuid.clone(),
+                    &mut reasoning,
+                    suffix("reasoning"),
+                    &parent_id,
                     timestamp,
-                    &shared_metadata,
+                    &metadata,
                 );
-                message_blocks.push(normalize_block(&item));
+                blocks.push(normalize_block(item));
             }
         }
     }
 
+    let tail = |kind: &str| id.as_ref().map(|id| format!("{id}:{kind}"));
     flush_reasoning(
         events,
-        &mut reasoning_blocks,
-        uuid.clone().map(|base| format!("{base}:reasoning")),
-        parent_uuid.clone(),
+        &mut reasoning,
+        tail("reasoning"),
+        &parent_id,
         timestamp,
-        &shared_metadata,
+        &metadata,
     );
     flush_message(
         events,
-        &mut message_blocks,
-        uuid,
-        parent_uuid,
+        &mut blocks,
+        id.clone(),
+        &parent_id,
         timestamp,
-        &shared_metadata,
+        &metadata,
     );
+}
+
+type EntryIdentity = (Option<String>, Option<String>, Option<DateTime<Utc>>);
+
+fn entry_identity(value: &Value) -> EntryIdentity {
+    let field = |key| value.get(key).and_then(Value::as_str).map(str::to_string);
+    (
+        field("uuid"),
+        field("parentUuid"),
+        field("timestamp").as_deref().and_then(parse_datetime),
+    )
 }
 
 fn flush_message(
     events: &mut Vec<SessionEvent>,
     blocks: &mut Vec<ContentBlock>,
     id: Option<String>,
-    parent_id: Option<String>,
+    parent_id: &Option<String>,
     timestamp: Option<DateTime<Utc>>,
     metadata: &BTreeMap<String, Value>,
 ) {
@@ -275,7 +292,7 @@ fn flush_message(
 
     events.push(SessionEvent::Message(MessageEvent {
         id,
-        parent_id,
+        parent_id: parent_id.clone(),
         role: "assistant".to_string(),
         timestamp,
         blocks: std::mem::take(blocks),
@@ -287,7 +304,7 @@ fn flush_reasoning(
     events: &mut Vec<SessionEvent>,
     summary: &mut Vec<String>,
     id: Option<String>,
-    parent_id: Option<String>,
+    parent_id: &Option<String>,
     timestamp: Option<DateTime<Utc>>,
     metadata: &BTreeMap<String, Value>,
 ) {
@@ -297,83 +314,14 @@ fn flush_reasoning(
 
     events.push(SessionEvent::Reasoning(ReasoningEvent {
         id,
-        parent_id,
+        parent_id: parent_id.clone(),
         timestamp,
         summary: std::mem::take(summary),
         metadata: metadata.clone(),
     }));
 }
 
-fn import_tool_use_block(
-    events: &mut Vec<SessionEvent>,
-    item: &Value,
-    timestamp: Option<DateTime<Utc>>,
-    parent_id: Option<String>,
-    source_parent: Option<String>,
-) {
-    let call_id = item
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let name = item
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let arguments = item.get("input").cloned().unwrap_or(Value::Null);
-
-    let mut metadata = BTreeMap::new();
-    if let Some(caller) = item.get("caller") {
-        metadata.insert("caller".to_string(), caller.clone());
-    }
-
-    events.push(SessionEvent::ToolCall(ToolCallEvent {
-        id: parent_id,
-        parent_id: source_parent,
-        call_id,
-        name,
-        timestamp,
-        arguments,
-        metadata,
-    }));
-}
-
-fn import_tool_result_block(
-    events: &mut Vec<SessionEvent>,
-    item: &Value,
-    timestamp: Option<DateTime<Utc>>,
-    event_id: Option<String>,
-    parent_id: Option<String>,
-) {
-    let output = item.get("content").cloned().unwrap_or(Value::Null);
-    let is_error = item
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    events.push(SessionEvent::ToolResult(ToolResultEvent {
-        id: event_id,
-        parent_id,
-        call_id: item
-            .get("tool_use_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        timestamp,
-        output,
-        is_error,
-        metadata: BTreeMap::new(),
-    }));
-}
-
 pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
-    let materialization = plan_output(session, output);
-    if let Some(parent) = materialization.session_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let session_id = claude_session_id(&session.metadata.session_id);
     let cwd = session
         .metadata
@@ -385,150 +333,118 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
         .git_branch
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
-    let created_at = session.metadata.created_at.or_else(|| {
-        session
-            .events
-            .iter()
-            .filter_map(SessionEvent::timestamp)
-            .min()
-    });
     let version = super::claude_cli_version();
 
-    let mut file = File::create(&materialization.session_file).with_context(|| {
-        format!(
-            "failed to create Claude session {}",
-            materialization.session_file.display()
-        )
-    })?;
+    // A `.jsonl` output is a standalone file; anything else is a Claude home,
+    // where sessions live under a slug of their working directory.
+    let native_store = output.extension().and_then(|ext| ext.to_str()) != Some("jsonl");
+    let session_file = if native_store {
+        output
+            .join("projects")
+            .join(path_to_claude_slug(&cwd))
+            .join(format!("{session_id}.jsonl"))
+    } else {
+        output.to_path_buf()
+    };
+
+    if let Some(parent) = session_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut file = File::create(&session_file)
+        .with_context(|| format!("failed to create Claude session {}", session_file.display()))?;
+
+    // Every record repeats the same session envelope and chains to the previous
+    // record's uuid; only the type, message and timestamp differ.
+    let entry = |kind: &str, parent: &Option<String>, uuid: &str, timestamp, message: Value| {
+        json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "userType": "external",
+            "entrypoint": "cli",
+            "cwd": cwd,
+            "sessionId": session_id,
+            "version": version,
+            "gitBranch": git_branch,
+            "type": kind,
+            "message": message,
+            "uuid": uuid,
+            "timestamp": rfc3339(event_time(timestamp)),
+        })
+    };
 
     let mut previous_uuid: Option<String> = None;
-    let mut tool_call_to_uuid = BTreeMap::new();
+    let mut tool_call_uuids = BTreeMap::new();
 
     for event in &session.events {
-        match event {
+        let uuid = Uuid::new_v4().to_string();
+        let line = match event {
             SessionEvent::Message(message) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let (projected_role, projected_blocks) = project_message_for_claude(message);
-                let content = encode_message_blocks(&projected_blocks);
+                let (role, blocks) = project_message_for_claude(message);
+                let content = encode_message_blocks(&blocks);
                 if content.is_null() {
                     continue;
                 }
-
-                let line = if projected_role == "assistant" {
-                    let assistant_message = claude_assistant_message(content, Value::Null);
-                    json!({
-                        "parentUuid": previous_uuid,
-                        "isSidechain": false,
-                        "userType": "external",
-                        "entrypoint": "cli",
-                        "cwd": cwd,
-                        "sessionId": session_id,
-                        "version": version,
-                        "gitBranch": git_branch,
-                        "message": assistant_message,
-                        "type": "assistant",
-                        "uuid": event_uuid,
-                        "timestamp": event_timestamp(message.timestamp),
-                    })
+                if role == "assistant" {
+                    entry(
+                        role,
+                        &previous_uuid,
+                        &uuid,
+                        message.timestamp,
+                        assistant_message(content, Value::Null),
+                    )
                 } else {
-                    json!({
-                        "parentUuid": previous_uuid,
-                        "isSidechain": false,
-                        "userType": "external",
-                        "entrypoint": "cli",
-                        "cwd": cwd,
-                        "sessionId": session_id,
-                        "version": version,
-                        "gitBranch": git_branch,
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": content,
-                        },
-                        "uuid": event_uuid,
-                        "timestamp": event_timestamp(message.timestamp),
-                        "permissionMode": "default",
-                    })
-                };
-
-                write_json_line(&mut file, &line)?;
-                previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
+                    let mut line = entry(
+                        role,
+                        &previous_uuid,
+                        &uuid,
+                        message.timestamp,
+                        json!({ "role": "user", "content": content }),
+                    );
+                    line["permissionMode"] = json!("default");
+                    line
+                }
             }
             SessionEvent::Reasoning(reasoning) => {
-                let event_uuid = Uuid::new_v4().to_string();
                 let content = reasoning
                     .summary
                     .iter()
-                    .map(|text| {
-                        json!({
-                            "type": "thinking",
-                            "thinking": text,
-                        })
-                    })
+                    .map(|text| json!({ "type": "thinking", "thinking": text }))
                     .collect::<Vec<_>>();
-                let assistant_message =
-                    claude_assistant_message(Value::Array(content), Value::Null);
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "entrypoint": "cli",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "message": assistant_message,
-                    "type": "assistant",
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(reasoning.timestamp),
-                });
-                write_json_line(&mut file, &line)?;
-                previous_uuid = line.get("uuid").and_then(Value::as_str).map(str::to_string);
+                entry(
+                    "assistant",
+                    &previous_uuid,
+                    &uuid,
+                    reasoning.timestamp,
+                    assistant_message(Value::Array(content), Value::Null),
+                )
             }
             SessionEvent::ToolCall(call) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let assistant_message = claude_assistant_message(
-                    json!([{
-                        "type": "tool_use",
-                        "id": call.call_id,
-                        "name": call.name,
-                        "input": encode_tool_input(&call.arguments),
-                        "caller": { "type": "direct" },
-                    }]),
-                    Value::String("tool_use".to_string()),
-                );
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "entrypoint": "cli",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "message": assistant_message,
-                    "type": "assistant",
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(call.timestamp),
-                });
-                write_json_line(&mut file, &line)?;
-                tool_call_to_uuid.insert(call.call_id.clone(), event_uuid.clone());
-                previous_uuid = Some(event_uuid);
+                tool_call_uuids.insert(call.call_id.clone(), uuid.clone());
+                entry(
+                    "assistant",
+                    &previous_uuid,
+                    &uuid,
+                    call.timestamp,
+                    assistant_message(
+                        json!([{
+                            "type": "tool_use",
+                            "id": call.call_id,
+                            "name": call.name,
+                            "input": encode_tool_input(&call.arguments),
+                            "caller": { "type": "direct" },
+                        }]),
+                        json!("tool_use"),
+                    ),
+                )
             }
             SessionEvent::ToolResult(result) => {
-                let event_uuid = Uuid::new_v4().to_string();
-                let source_uuid = tool_call_to_uuid.get(&result.call_id).cloned();
-                let line = json!({
-                    "parentUuid": previous_uuid,
-                    "isSidechain": false,
-                    "userType": "external",
-                    "entrypoint": "cli",
-                    "cwd": cwd,
-                    "sessionId": session_id,
-                    "version": version,
-                    "gitBranch": git_branch,
-                    "type": "user",
-                    "message": {
+                let mut line = entry(
+                    "user",
+                    &previous_uuid,
+                    &uuid,
+                    result.timestamp,
+                    json!({
                         "role": "user",
                         "content": [{
                             "type": "tool_result",
@@ -536,80 +452,52 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                             "content": encode_tool_result_output(&result.output),
                             "is_error": result.is_error,
                         }]
-                    },
-                    "uuid": event_uuid,
-                    "timestamp": event_timestamp(result.timestamp),
-                    "toolUseResult": tool_result_summary(&result.output, result.is_error),
-                    "sourceToolAssistantUUID": source_uuid,
-                });
-                write_json_line(&mut file, &line)?;
-                previous_uuid = Some(event_uuid);
+                    }),
+                );
+                line["toolUseResult"] = tool_result_summary(&result.output, result.is_error);
+                line["sourceToolAssistantUUID"] = json!(tool_call_uuids.get(&result.call_id));
+                line
             }
-        }
+        };
+
+        write_json_line(&mut file, &line)?;
+        previous_uuid = Some(uuid);
     }
 
-    if let Some(history_file) = &materialization.history_file {
-        if let Some(parent) = history_file.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
+    if native_store {
+        let history_path = output.join("history.jsonl");
         let mut history = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(history_file)
-            .with_context(|| format!("failed to open {}", history_file.display()))?;
+            .open(&history_path)
+            .with_context(|| format!("failed to open {}", history_path.display()))?;
         write_json_line(
             &mut history,
             &json!({
                 "display": derive_title(session).unwrap_or_else(|| "Imported session".to_string()),
                 "pastedContents": {},
-                "timestamp": created_at
-                    .unwrap_or_else(Utc::now)
-                    .timestamp_millis(),
+                "timestamp": event_time(session.metadata.created_at).timestamp_millis(),
                 "project": cwd.display().to_string(),
                 "sessionId": session_id,
             }),
         )?;
     }
 
-    Ok(materialization.session_file)
+    Ok(session_file)
 }
 
-fn plan_output(session: &UniversalSession, output: &Path) -> ClaudeMaterialization {
-    if output.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-        return ClaudeMaterialization {
-            session_file: output.to_path_buf(),
-            history_file: None,
-        };
-    }
-
-    let cwd = session
-        .metadata
-        .cwd
-        .as_deref()
-        .unwrap_or_else(|| Path::new("."));
-    let slug = path_to_claude_slug(cwd);
-    let session_id = claude_session_id(&session.metadata.session_id);
-    ClaudeMaterialization {
-        session_file: output
-            .join("projects")
-            .join(slug)
-            .join(format!("{session_id}.jsonl")),
-        history_file: Some(output.join("history.jsonl")),
-    }
+fn event_time(timestamp: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    timestamp.unwrap_or_else(Utc::now)
 }
 
+/// Claude keys its project directories by the working directory with every
+/// non-alphanumeric character replaced by a dash.
 fn path_to_claude_slug(path: &Path) -> String {
-    let rendered = path.to_string_lossy();
-    let mut slug = String::with_capacity(rendered.len());
-    for ch in rendered.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-        } else {
-            slug.push('-');
-        }
-    }
+    let slug: String = path
+        .to_string_lossy()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
     if slug.starts_with('-') {
         slug
     } else {
@@ -622,57 +510,52 @@ fn encode_message_blocks(blocks: &[ContentBlock]) -> Value {
         return Value::Null;
     }
 
-    let encoded = blocks
-        .iter()
-        .map(|block| {
-            if block.kind == "input_image"
-                && let Some(image_url) = block
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("image_url"))
-                    .and_then(Value::as_str)
-            {
-                return encode_claude_image(image_url);
-            }
-
-            let mut object = Map::new();
-            object.insert(
-                "type".to_string(),
-                Value::String(claude_block_kind(&block.kind).to_string()),
-            );
-            if let Some(text) = &block.text {
-                let text_key = if block.kind == "thinking" {
-                    "thinking"
-                } else {
-                    "text"
-                };
-                object.insert(text_key.to_string(), Value::String(text.clone()));
-            }
-            if let Some(data) = &block.data {
-                if let Value::Object(extra) = data {
-                    object.extend(extra.clone());
-                } else {
-                    object.insert("data".to_string(), data.clone());
+    Value::Array(
+        blocks
+            .iter()
+            .map(|block| {
+                if block.kind == "input_image"
+                    && let Some(image_url) = block
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("image_url"))
+                        .and_then(Value::as_str)
+                {
+                    return encode_claude_image(image_url);
                 }
-            }
-            Value::Object(object)
-        })
-        .collect::<Vec<_>>();
-    Value::Array(encoded)
+
+                let mut object = Map::new();
+                object.insert("type".to_string(), claude_block_kind(&block.kind).into());
+                if let Some(text) = &block.text {
+                    let key = if block.kind == "thinking" {
+                        "thinking"
+                    } else {
+                        "text"
+                    };
+                    object.insert(key.to_string(), text.clone().into());
+                }
+                match &block.data {
+                    Some(Value::Object(extra)) => object.extend(extra.clone()),
+                    Some(data) => {
+                        object.insert("data".to_string(), data.clone());
+                    }
+                    None => {}
+                }
+                Value::Object(object)
+            })
+            .collect(),
+    )
 }
 
-fn claude_assistant_message(content: Value, stop_reason: Value) -> Value {
-    let mut message = Map::new();
-    message.insert(
-        "id".to_string(),
-        Value::String(format!("msg_{}", Uuid::new_v4().simple())),
-    );
-    message.insert("type".to_string(), Value::String("message".to_string()));
-    message.insert("role".to_string(), Value::String("assistant".to_string()));
-    message.insert("content".to_string(), content);
-    message.insert("stop_reason".to_string(), stop_reason);
-    message.insert("stop_sequence".to_string(), Value::Null);
-    Value::Object(message)
+fn assistant_message(content: Value, stop_reason: Value) -> Value {
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": Value::Null,
+    })
 }
 
 fn encode_tool_input(input: &Value) -> Value {
@@ -682,31 +565,35 @@ fn encode_tool_input(input: &Value) -> Value {
     }
 }
 
+/// Claude only accepts `text`, `image` and `document` blocks inside a tool
+/// result; anything else is flattened to a JSON string.
 fn encode_tool_result_output(output: &Value) -> Value {
-    match output {
-        Value::String(text) => Value::String(text.clone()),
-        Value::Array(items) if !items.is_empty() => {
-            let mut encoded = Vec::with_capacity(items.len());
-            for item in items {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("input_text" | "output_text") => encoded.push(json!({
-                        "type": "text",
-                        "text": item.get("text").and_then(Value::as_str).unwrap_or_default(),
-                    })),
-                    Some("input_image") => {
-                        let Some(image_url) = item.get("image_url").and_then(Value::as_str) else {
-                            return Value::String(json_to_string(output));
-                        };
-                        encoded.push(encode_claude_image(image_url));
-                    }
-                    Some("text" | "image" | "document") => encoded.push(item.clone()),
-                    _ => return Value::String(json_to_string(output)),
-                }
-            }
-            Value::Array(encoded)
-        }
-        other => Value::String(json_to_string(other)),
+    let Value::Array(items) = output else {
+        return match output {
+            Value::String(text) => Value::String(text.clone()),
+            other => Value::String(json_to_string(other)),
+        };
+    };
+    if items.is_empty() {
+        return Value::String(json_to_string(output));
     }
+
+    let mut encoded = Vec::with_capacity(items.len());
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text") => encoded.push(json!({
+                "type": "text",
+                "text": item.get("text").and_then(Value::as_str).unwrap_or_default(),
+            })),
+            Some("input_image") => match item.get("image_url").and_then(Value::as_str) {
+                Some(image_url) => encoded.push(encode_claude_image(image_url)),
+                None => return Value::String(json_to_string(output)),
+            },
+            Some("text" | "image" | "document") => encoded.push(item.clone()),
+            _ => return Value::String(json_to_string(output)),
+        }
+    }
+    Value::Array(encoded)
 }
 
 fn encode_claude_image(image_url: &str) -> Value {
@@ -715,20 +602,13 @@ fn encode_claude_image(image_url: &str) -> Value {
     {
         return json!({
             "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": data,
-            }
+            "source": { "type": "base64", "media_type": media_type, "data": data },
         });
     }
 
     json!({
         "type": "image",
-        "source": {
-            "type": "url",
-            "url": image_url,
-        }
+        "source": { "type": "url", "url": image_url },
     })
 }
 
@@ -745,108 +625,24 @@ fn tool_result_summary(output: &Value, is_error: bool) -> Value {
             "isImage": false,
             "noOutputExpected": false,
         }),
-        other => json!({
-            "value": other,
-        }),
+        other => json!({ "value": other }),
     }
-}
-
-fn normalize_block(value: &Value) -> ContentBlock {
-    let kind = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("text")
-        .to_string();
-    let text = ["text", "thinking", "content"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str))
-        .map(str::to_string);
-    let mut object = value.as_object().cloned().unwrap_or_default();
-    object.remove("type");
-    object.remove("text");
-    object.remove("thinking");
-    object.remove("content");
-    let data = (!object.is_empty()).then_some(Value::Object(object));
-
-    ContentBlock { kind, text, data }
-}
-
-fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-fn event_timestamp(timestamp: Option<DateTime<Utc>>) -> String {
-    timestamp
-        .unwrap_or_else(Utc::now)
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-fn write_json_line(file: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *file, value).context("failed to encode JSONL line")?;
-    file.write_all(b"\n").context("failed to write newline")
-}
-
-fn update_time_bounds(metadata: &mut SessionMetadata, timestamp: Option<DateTime<Utc>>) {
-    let Some(timestamp) = timestamp else {
-        return;
-    };
-    metadata.created_at = Some(match metadata.created_at {
-        Some(current) => current.min(timestamp),
-        None => timestamp,
-    });
-    metadata.updated_at = Some(match metadata.updated_at {
-        Some(current) => current.max(timestamp),
-        None => timestamp,
-    });
-}
-
-fn derive_title(session: &UniversalSession) -> Option<String> {
-    session.events.iter().find_map(|event| {
-        let SessionEvent::Message(message) = event else {
-            return None;
-        };
-        if message.role != "user" {
-            return None;
-        }
-        message
-            .blocks
-            .iter()
-            .filter_map(|block| block.text.as_deref())
-            .map(collapse_whitespace)
-            .find(|text| !text.is_empty())
-    })
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(80)
-        .collect()
 }
 
 fn claude_session_id(candidate: &str) -> String {
     Uuid::parse_str(candidate)
-        .map(|uuid| uuid.to_string())
-        .unwrap_or_else(|_| Uuid::new_v4().to_string())
+        .unwrap_or_else(|_| Uuid::new_v4())
+        .to_string()
 }
 
-fn json_to_string(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
-    }
-}
-
+/// Claude only knows `user` and `assistant`. Codex's `developer` role (repo
+/// instructions) is kept as a labelled user message rather than dropped.
 fn project_message_for_claude(message: &MessageEvent) -> (&'static str, Vec<ContentBlock>) {
+    let mut blocks = message.blocks.clone();
     match message.role.as_str() {
-        "assistant" => ("assistant", message.blocks.clone()),
-        "user" => ("user", message.blocks.clone()),
+        "assistant" => ("assistant", blocks),
+        "user" => ("user", blocks),
         other => {
-            let mut blocks = message.blocks.clone();
             let prefix = format!("[transession imported {other} message]");
             match blocks.first_mut() {
                 Some(block) if block.text.is_some() => {
@@ -866,7 +662,6 @@ fn claude_block_kind(kind: &str) -> &'static str {
         "image" => "image",
         "tool_use" => "tool_use",
         "tool_result" => "tool_result",
-        "input_text" | "output_text" | "text" => "text",
         _ => "text",
     }
 }

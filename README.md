@@ -5,180 +5,70 @@
 > [!IMPORTANT]
 > **Tested compatibility (2026-08-18):** Codex CLI [`0.147.0`](https://github.com/openai/codex/releases/tag/rust-v0.147.0) and Claude Code [`2.1.234`](https://github.com/anthropics/claude-code/releases/tag/v2.1.234), in both directions, verified by resuming the translated session in the target CLI. If either installed CLI is newer, its private session format is not yet verified against this version of `transession`.
 
-Translated sessions are stamped with the version of the CLI installed on your machine (`codex --version`, `claude --version`), so they no longer claim to come from whatever release `transession` was last tested against. When the target CLI is not installed, the versions above are used instead.
-
-The default workflow is direct native-to-native conversion by session id:
-
-```bash
-transession --from claude --to codex <SESSION_ID>
-transession --from codex --to claude <SESSION_ID>
-```
-
-By default, `transession`:
-
-- resolves the source session id from the local Claude or Codex store
-- creates a fresh target session id automatically
-- writes the translated session into the target tool's storage
-- immediately opens the translated session in the target agent
-
-If you only want the translation and do not want to start the target agent yet:
-
-```bash
-transession --from claude --to codex <SESSION_ID> --no-open
-transession --from codex --to claude <SESSION_ID> --no-open
-```
-
 ## Install
 
 ```bash
 cargo install transession
 ```
 
-Or install directly from GitHub:
+Or from GitHub (`--git https://github.com/inmzhang/transession.git`) or a local checkout (`--path .`).
+
+## Usage
 
 ```bash
-cargo install --git https://github.com/inmzhang/transession.git
+transession --from claude --to codex <SESSION_ID>
+transession --from codex --to claude <SESSION_ID>
 ```
 
-Or from a local checkout:
+By default `transession` resolves the session id in the local Claude or Codex
+store, assigns a fresh target session id, writes the translated session into the
+target tool's storage, and immediately opens it in the target agent. Add
+`--no-open` to stop after the translation, or `--output <DIR>` to write into a
+different store root.
 
-```bash
-cargo install --path .
-```
+Translated sessions are stamped with the version of the CLI installed on your
+machine (`codex --version`, `claude --version`), falling back to the versions
+above when the target CLI is not installed.
 
-For development:
+Sessions can be addressed by native session id or by file path. Store roots are
+discovered from, in order:
 
-```bash
-git clone https://github.com/inmzhang/transession.git
-cd transession
-cargo build --release
-```
+- Codex: `TRANSESSION_CODEX_HOME`, `CODEX_HOME`, `~/.codex`
+- Claude: `TRANSESSION_CLAUDE_HOME`, `CLAUDE_CONFIG_DIR`, `CLAUDE_HOME`, `~/.claude`
 
-## Quick Start
+`--from` is optional; the format is autodetected when it is omitted.
 
-Convert a Claude session into Codex and open the translated Codex session immediately:
+### Opening the translated session
 
-```bash
-transession --from claude --to codex <CLAUDE_SESSION_ID>
-```
-
-Convert a Codex session into Claude and open the translated Claude session immediately:
-
-```bash
-transession --from codex --to claude <CODEX_SESSION_ID>
-```
-
-If you want the translated session to be written somewhere else first, override the target root explicitly:
-
-```bash
-transession --from claude --to codex <SESSION_ID> --output ./tmp/codex-home
-transession --from codex --to claude <SESSION_ID> --output ./tmp/claude-home
-```
-
-When opening after translation, `transession` launches the target CLI with the translated session id. Only a custom output root redirects the target CLI's home: `CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude. Writing into the installed store leaves those variables alone, because `CLAUDE_CONFIG_DIR` also moves Claude Code's account file from `~/.claude.json` to `<dir>/.claude.json` and would otherwise force a fresh login.
-
-For custom output roots, `transession` links the installed credentials into the target home when needed, so the launched CLI can authenticate immediately: `auth.json` for Codex, `.credentials.json` and `.claude.json` for Claude.
-
-## Session Lookup
-
-For Codex and Claude inputs, `transession` accepts either:
-
-- a native session id
-- a direct session file path
-
-By default it searches:
-
-- Codex: `TRANSESSION_CODEX_HOME`, then `CODEX_HOME`, then `~/.codex`
-- Claude: `TRANSESSION_CLAUDE_HOME`, then `CLAUDE_CONFIG_DIR`, then `CLAUDE_HOME`, then `~/.claude`
-
-That means you can usually use the same id you would pass to `codex resume` or `claude -r`.
+Only a custom `--output` root redirects the target CLI's home (`CODEX_HOME` for
+Codex, `CLAUDE_CONFIG_DIR` plus `CLAUDE_HOME` for Claude), and the installed
+credentials are linked into it so the launched CLI can authenticate
+immediately. Writing into the installed store leaves those variables alone,
+because `CLAUDE_CONFIG_DIR` also moves Claude Code's account file from
+`~/.claude.json` to `<dir>/.claude.json` and would otherwise force a fresh
+login.
 
 ## What Gets Preserved
 
-`transession` preserves the main conversation state needed for practical handoff:
+User and assistant messages, reasoning summaries, tool calls and results,
+timestamps, working directory and branch, and the platform metadata needed for
+native session discovery.
 
-- user and assistant messages
-- reasoning summaries
-- tool calls and tool results
-- timestamps
-- working directory and branch hints
-- lightweight platform metadata needed for native session discovery
+Not preserved:
 
-## Caveats
-
-`transession` intentionally focuses on the durable conversation logs and lightweight resume metadata. It does not recreate every platform-specific side channel.
-
-The current test suite covers the main happy paths, but real-world session logs are messy and platform behavior keeps evolving. You should expect some edge cases and translation failures to surface over time, and the converter will likely need further iteration as those cases are discovered.
-
-Known omissions:
-
-- opaque reasoning payloads and token-accounting side data
-- Codex's paginated `item_completed` thread items; translated sessions use the legacy event history that Codex still replays
+- opaque reasoning payloads and token accounting
+- Codex's paginated `item_completed` thread items; translated sessions use the legacy event history Codex still replays
 - Codex shell snapshot sidecars (the thread row in `state_5.sqlite` is written)
 - Claude subagent trees and tool-result sidecar directories
 - platform-specific runtime caches outside the main session log
 
-## Development
-
-Local development checks:
-
-```bash
-cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-```
-
-Pre-commit hooks are configured in `.pre-commit-config.yaml`.
-
-To enable them locally:
-
-```bash
-pipx install pre-commit
-pre-commit install
-```
-
-The configured hooks run:
-
-- `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test`
-
-GitHub Actions workflows are included:
-
-- `.github/workflows/ci.yml` for formatting, linting, and tests
-- `.github/workflows/publish.yml` for dry-run or real crates.io publishing
-
-## Publishing
-
-The repository is prepared for `cargo install transession` once the crate is published.
-
-What you need to do before the real publish:
-
-1. Create a crates.io API token with publish permission.
-2. Add that token to the GitHub repository secrets as `CARGO_REGISTRY_TOKEN`.
-3. Make sure the version in `Cargo.toml` is the version you want to release.
-4. Push the release commit to `master`.
-
-How to run the publish workflow:
-
-- For a dry run in GitHub Actions: open the `publish` workflow and run `workflow_dispatch` with `dry_run=true`.
-- For a real publish in GitHub Actions: run `workflow_dispatch` with `dry_run=false`, or push a tag like `v0.1.3`.
-
-The publish workflow will:
-
-- verify formatting
-- run clippy with `-D warnings`
-- run tests
-- verify that a pushed `vX.Y.Z` tag matches the `Cargo.toml` version
-- run `cargo publish --locked`
-
-The crate name `transession` appeared available during the latest local check, and `cargo publish --dry-run` succeeded locally. You should still treat name availability as time-sensitive until the first real publish completes.
+Real-world session logs are messy and both platforms keep evolving, so expect
+edge cases beyond the happy paths the test suite covers.
 
 ## Advanced Usage
 
-There is also a portable intermediate representation for debugging and advanced workflows, but it is intentionally not the main interface.
-
-Advanced commands remain available:
+There is also a portable intermediate representation for debugging, reachable
+through the subcommands:
 
 ```bash
 transession inspect <SESSION_ID> --from claude
@@ -187,6 +77,24 @@ transession export ./session.json ./out/codex-home --to codex --new-session-id
 transession convert <SESSION_ID> ./out/claude-home --from codex --to claude --new-session-id
 ```
 
+## Development
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+The same three checks run in `.github/workflows/ci.yml` and, via
+`.pre-commit-config.yaml`, as pre-commit hooks (`pipx install pre-commit &&
+pre-commit install`).
+
+Releases go through `.github/workflows/publish.yml`: `workflow_dispatch` with
+`dry_run=true` for a dry run, or push a `vX.Y.Z` tag matching the `Cargo.toml`
+version to publish to crates.io using the `CARGO_REGISTRY_TOKEN` secret.
+
 ## AI Disclaimer
 
-This project was built with Codex. The code and documentation were generated and refined collaboratively with AI assistance, then validated locally with tests and CLI smoke checks.
+This project was built with Codex. The code and documentation were generated and
+refined collaboratively with AI assistance, then validated locally with tests
+and CLI smoke checks.

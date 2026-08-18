@@ -4,11 +4,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Local, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+use super::{
+    derive_title, first_user_text, json_to_string, normalize_block, parse_datetime, rfc3339,
+    update_time_bounds, write_json_line,
+};
 use crate::ir::{
     ContentBlock, MessageEvent, ReasoningEvent, SessionEvent, SessionFormat, SessionMetadata,
     ToolCallEvent, ToolResultEvent, UniversalSession,
@@ -18,26 +22,14 @@ use crate::ir::{
 // picker compare it verbatim, so match that spelling.
 const CODEX_MODEL_PROVIDER: &str = "openai";
 
-pub struct CodexMaterialization {
-    pub session_file: PathBuf,
-    pub session_index: Option<PathBuf>,
-}
-
-struct ActiveTurn {
-    turn_id: String,
-    last_agent_message: Option<String>,
-    last_timestamp: Option<DateTime<Utc>>,
-}
-
 pub fn load(path: &Path) -> Result<UniversalSession> {
     let file = File::open(path)
         .with_context(|| format!("failed to open Codex session {}", path.display()))?;
-    let reader = BufReader::new(file);
 
     let mut session = UniversalSession::new(Uuid::now_v7().to_string());
     session.metadata.source_format = Some(SessionFormat::Codex);
 
-    for line in reader.lines() {
+    for line in BufReader::new(file).lines() {
         let line = line.with_context(|| format!("failed to read {}", path.display()))?;
         if line.trim().is_empty() {
             continue;
@@ -55,21 +47,20 @@ pub fn load(path: &Path) -> Result<UniversalSession> {
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => import_session_meta(&mut session.metadata, &value),
             Some("turn_context") => import_turn_context(&mut session.metadata, &value),
-            Some("response_item") => import_response_item(&mut session.events, &value),
+            Some("response_item") => import_response_item(&mut session.events, &value, timestamp),
             _ => {}
         }
     }
 
     if session.metadata.title.is_none() {
-        session.metadata.title = derive_title(&session);
+        session.metadata.title = first_user_text(&session);
     }
 
     Ok(session)
 }
 
 fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
-    let payload = value.get("payload").and_then(Value::as_object);
-    let Some(payload) = payload else {
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
         return;
     };
 
@@ -94,34 +85,21 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
         .map(str::to_string)
         .or_else(|| metadata.platform_version.clone());
 
-    if let Some(source) = payload.get("source") {
-        metadata
-            .extra
-            .insert("codex_source".to_string(), source.clone());
+    for key in ["source", "model_provider", "originator"] {
+        copy_extra(payload, metadata, key);
     }
-    if let Some(model_provider) = payload.get("model_provider") {
-        metadata
-            .extra
-            .insert("codex_model_provider".to_string(), model_provider.clone());
-    }
-    if let Some(originator) = payload.get("originator") {
-        metadata
-            .extra
-            .insert("codex_originator".to_string(), originator.clone());
-    }
-    if let Some(base_instructions) = payload
+    if let Some(text) = payload
         .get("base_instructions")
         .and_then(|value| value.get("text"))
     {
-        metadata.extra.insert(
-            "codex_base_instructions".to_string(),
-            base_instructions.clone(),
-        );
+        metadata
+            .extra
+            .insert("codex_base_instructions".to_string(), text.clone());
     }
 
-    // Codex 0.147 records the repository state in session_meta. Keeping the
-    // whole block lets us re-export it verbatim, while the branch also feeds
-    // the Claude `gitBranch` field and the Codex picker column.
+    // Codex records the repository state in session_meta. Keeping the whole
+    // block lets us re-export it verbatim, while the branch also feeds the
+    // Claude `gitBranch` field and the Codex picker column.
     if let Some(git) = payload.get("git") {
         if let Some(branch) = git.get("branch").and_then(Value::as_str) {
             metadata.git_branch = Some(branch.to_string());
@@ -131,8 +109,7 @@ fn import_session_meta(metadata: &mut SessionMetadata, value: &Value) {
 }
 
 fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
-    let payload = value.get("payload").and_then(Value::as_object);
-    let Some(payload) = payload else {
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
         return;
     };
 
@@ -141,348 +118,241 @@ fn import_turn_context(metadata: &mut SessionMetadata, value: &Value) {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .or_else(|| metadata.cwd.clone());
-
     if let Some(model) = payload.get("model").and_then(Value::as_str) {
         metadata.model = Some(model.to_string());
     }
 
-    if let Some(personality) = payload.get("personality") {
-        metadata
-            .extra
-            .insert("codex_personality".to_string(), personality.clone());
-    }
-    copy_if_present(
-        payload,
-        metadata,
+    for key in [
+        "personality",
         "approval_policy",
-        "codex_approval_policy",
-    );
-    copy_if_present(payload, metadata, "sandbox_policy", "codex_sandbox_policy");
-    copy_if_present(
-        payload,
-        metadata,
+        "sandbox_policy",
         "collaboration_mode",
-        "codex_collaboration_mode",
-    );
-    copy_if_present(
-        payload,
-        metadata,
         "user_instructions",
-        "codex_user_instructions",
-    );
-    copy_if_present(payload, metadata, "timezone", "codex_timezone");
-    copy_if_present(payload, metadata, "current_date", "codex_current_date");
+        "timezone",
+        "current_date",
+    ] {
+        copy_extra(payload, metadata, key);
+    }
 }
 
-fn import_response_item(events: &mut Vec<SessionEvent>, value: &Value) {
-    let payload = value.get("payload").cloned().unwrap_or(Value::Null);
+fn copy_extra(payload: &Map<String, Value>, metadata: &mut SessionMetadata, key: &str) {
+    if let Some(value) = payload.get(key) {
+        metadata.extra.insert(format!("codex_{key}"), value.clone());
+    }
+}
+
+fn import_response_item(
+    events: &mut Vec<SessionEvent>,
+    value: &Value,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+        return;
+    };
     let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
         return;
     };
-    let timestamp = value
-        .get("timestamp")
+    let id = payload
+        .get("id")
         .and_then(Value::as_str)
-        .and_then(parse_datetime);
+        .map(str::to_string);
 
     match payload_type {
-        "message" => import_message(events, payload, timestamp),
-        "reasoning" => import_reasoning(events, payload, timestamp),
-        "function_call" | "custom_tool_call" => import_tool_call(events, payload, timestamp),
+        "message" => {
+            let blocks: Vec<ContentBlock> = payload
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(normalize_block).collect())
+                .unwrap_or_default();
+            if blocks.is_empty() {
+                return;
+            }
+            events.push(SessionEvent::Message(MessageEvent {
+                id,
+                parent_id: None,
+                role: payload
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                    .to_string(),
+                timestamp,
+                blocks,
+                metadata: BTreeMap::new(),
+            }));
+        }
+        "reasoning" => {
+            let summary: Vec<String> = payload
+                .get("summary")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if summary.is_empty() {
+                return;
+            }
+            events.push(SessionEvent::Reasoning(ReasoningEvent {
+                id,
+                parent_id: None,
+                timestamp,
+                summary,
+                metadata: BTreeMap::new(),
+            }));
+        }
+        // Freeform (`custom_tool_call`) tools put their payload in `input`
+        // instead of `arguments`, and both spell it as an embedded JSON string.
+        "function_call" | "custom_tool_call" => {
+            events.push(SessionEvent::ToolCall(ToolCallEvent {
+                id,
+                parent_id: None,
+                call_id: string_field(payload, "call_id"),
+                name: payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                timestamp,
+                arguments: payload
+                    .get("arguments")
+                    .or_else(|| payload.get("input"))
+                    .map(|value| match value {
+                        Value::String(text) => {
+                            serde_json::from_str(text).unwrap_or_else(|_| value.clone())
+                        }
+                        value => value.clone(),
+                    })
+                    .unwrap_or(Value::Null),
+                metadata: BTreeMap::new(),
+            }))
+        }
         "function_call_output" | "custom_tool_call_output" => {
-            import_tool_result(events, payload, timestamp)
+            events.push(SessionEvent::ToolResult(ToolResultEvent {
+                id,
+                parent_id: None,
+                call_id: string_field(payload, "call_id"),
+                timestamp,
+                output: payload
+                    .get("output")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new())),
+                // TODO: Codex encodes failures inside the output payload; we do
+                // not currently parse them out into `is_error`.
+                is_error: false,
+                metadata: BTreeMap::new(),
+            }))
         }
         _ => {}
     }
 }
 
-fn import_message(
-    events: &mut Vec<SessionEvent>,
-    payload: Value,
-    timestamp: Option<DateTime<Utc>>,
-) {
-    let Some(payload_object) = payload.as_object() else {
-        return;
-    };
-
-    let role = payload_object
-        .get("role")
+fn string_field(payload: &Map<String, Value>, key: &str) -> String {
+    payload
+        .get(key)
         .and_then(Value::as_str)
-        .unwrap_or("assistant")
-        .to_string();
-    let blocks: Vec<ContentBlock> = payload_object
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(normalize_block).collect())
-        .unwrap_or_default();
-
-    if blocks.is_empty() {
-        return;
-    }
-
-    events.push(SessionEvent::Message(MessageEvent {
-        id: payload_object
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        parent_id: None,
-        role,
-        timestamp,
-        blocks,
-        metadata: BTreeMap::new(),
-    }));
-}
-
-fn import_reasoning(
-    events: &mut Vec<SessionEvent>,
-    payload: Value,
-    timestamp: Option<DateTime<Utc>>,
-) {
-    let Some(payload_object) = payload.as_object() else {
-        return;
-    };
-
-    let summary: Vec<String> = payload_object
-        .get("summary")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if summary.is_empty() {
-        return;
-    }
-
-    events.push(SessionEvent::Reasoning(ReasoningEvent {
-        id: payload_object
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        parent_id: None,
-        timestamp,
-        summary,
-        metadata: BTreeMap::new(),
-    }));
-}
-
-fn import_tool_call(
-    events: &mut Vec<SessionEvent>,
-    payload: Value,
-    timestamp: Option<DateTime<Utc>>,
-) {
-    let Some(payload_object) = payload.as_object() else {
-        return;
-    };
-
-    let arguments = payload_object
-        .get("arguments")
-        .or_else(|| payload_object.get("input"))
-        .map(|value| match value {
-            Value::String(value) => parse_jsonish(value),
-            value => value.clone(),
-        })
-        .unwrap_or(Value::Null);
-
-    events.push(SessionEvent::ToolCall(ToolCallEvent {
-        id: payload_object
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        parent_id: None,
-        call_id: payload_object
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        name: payload_object
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        timestamp,
-        arguments,
-        metadata: BTreeMap::new(),
-    }));
-}
-
-fn import_tool_result(
-    events: &mut Vec<SessionEvent>,
-    payload: Value,
-    timestamp: Option<DateTime<Utc>>,
-) {
-    let Some(payload_object) = payload.as_object() else {
-        return;
-    };
-
-    let output = payload_object
-        .get("output")
-        .cloned()
-        .unwrap_or(Value::String(String::new()));
-
-    events.push(SessionEvent::ToolResult(ToolResultEvent {
-        id: payload_object
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        parent_id: None,
-        call_id: payload_object
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        timestamp,
-        output,
-        is_error: false,
-        metadata: BTreeMap::new(),
-    }));
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
-    let materialization = plan_output(session, output);
-    if let Some(parent) = materialization.session_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let mut file = File::create(&materialization.session_file).with_context(|| {
-        format!(
-            "failed to create Codex session file {}",
-            materialization.session_file.display()
-        )
-    })?;
-
     let session_id = codex_session_id(&session.metadata.session_id);
-    let created_at = session
-        .metadata
-        .created_at
-        .or_else(|| {
-            session
-                .events
-                .iter()
-                .filter_map(SessionEvent::timestamp)
-                .min()
-        })
-        .unwrap_or_else(Utc::now);
-    let updated_at = session
-        .metadata
-        .updated_at
-        .or_else(|| {
-            session
-                .events
-                .iter()
-                .filter_map(SessionEvent::timestamp)
-                .max()
-        })
-        .unwrap_or(created_at);
+    let (created_at, updated_at) = time_bounds(session);
     let cwd = session
         .metadata
         .cwd
         .clone()
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut session_meta_payload = Map::new();
-    session_meta_payload.insert("id".to_string(), Value::String(session_id.clone()));
-    session_meta_payload.insert("session_id".to_string(), Value::String(session_id.clone()));
-    session_meta_payload.insert(
-        "timestamp".to_string(),
-        Value::String(created_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
-    );
-    session_meta_payload.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
-    session_meta_payload.insert(
-        "originator".to_string(),
-        extra_string(&session.metadata, "codex_originator")
-            .unwrap_or_else(|| "transession".to_string())
-            .into(),
-    );
-    session_meta_payload.insert("cli_version".to_string(), super::codex_cli_version().into());
-    session_meta_payload.insert(
-        "source".to_string(),
-        session
-            .metadata
-            .extra
-            .get("codex_source")
-            .cloned()
-            .unwrap_or_else(|| Value::String("cli".to_string())),
-    );
-    session_meta_payload.insert(
-        "model_provider".to_string(),
-        Value::String(CODEX_MODEL_PROVIDER.to_string()),
-    );
-    session_meta_payload.insert("thread_source".to_string(), "user".into());
-    session_meta_payload.insert("history_mode".to_string(), "legacy".into());
-    if let Some(base_instructions) = extra_string(&session.metadata, "codex_base_instructions") {
-        session_meta_payload.insert(
-            "base_instructions".to_string(),
-            json!({ "text": base_instructions }),
-        );
+    // A `.jsonl` output is a standalone file; anything else is a Codex home,
+    // which also needs the thread registered so the resume picker finds it.
+    let native_store = output.extension().and_then(|ext| ext.to_str()) != Some("jsonl");
+    let session_file = if native_store {
+        let local = created_at.with_timezone(&Local);
+        output
+            .join("sessions")
+            .join(format!("{:04}", local.year()))
+            .join(format!("{:02}", local.month()))
+            .join(format!("{:02}", local.day()))
+            .join(format!(
+                "rollout-{}-{session_id}.jsonl",
+                local.format("%Y-%m-%dT%H-%M-%S")
+            ))
+    } else {
+        output.to_path_buf()
+    };
+
+    if let Some(parent) = session_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    if let Some(git) = codex_git_info(&session.metadata) {
-        session_meta_payload.insert("git".to_string(), git);
-    }
+    let mut file = File::create(&session_file).with_context(|| {
+        format!(
+            "failed to create Codex session file {}",
+            session_file.display()
+        )
+    })?;
 
     write_json_line(
         &mut file,
         &json!({
-            "timestamp": created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "timestamp": rfc3339(created_at),
             "type": "session_meta",
-            "payload": session_meta_payload,
+            "payload": session_meta_payload(session, &session_id, &cwd, created_at),
         }),
     )?;
 
+    // Codex replays a session as a sequence of turns: a user message closes the
+    // previous turn and opens a new one, and every other event joins whichever
+    // turn is open (starting one if the session begins mid-conversation).
     let mut active_turn: Option<ActiveTurn> = None;
 
     for event in &session.events {
+        let timestamp = event.timestamp().unwrap_or(updated_at);
+        let at = rfc3339(timestamp);
+
         match event {
-            SessionEvent::Message(message) => {
-                let timestamp = message.timestamp.unwrap_or(updated_at);
-                let rendered_text = render_message_text(message);
+            SessionEvent::Message(message) if message.role == "user" => {
+                close_turn(&mut file, &mut active_turn, updated_at)?;
+                active_turn = Some(start_turn(&mut file, timestamp)?);
+                write_message_response_item(&mut file, message, &at)?;
 
-                if message.role == "user" {
-                    close_turn(&mut file, &mut active_turn, updated_at)?;
-                    active_turn = Some(start_turn(&mut file, timestamp)?);
-                    write_message_response_item(&mut file, message, updated_at)?;
-                    let images = message
-                        .blocks
-                        .iter()
-                        .filter_map(codex_image_url)
-                        .collect::<Vec<_>>();
-                    if rendered_text.is_some() || !images.is_empty() {
-                        write_json_line(
-                            &mut file,
-                            &json!({
-                                "timestamp": event_timestamp(message.timestamp, updated_at),
-                                "type": "event_msg",
-                                "payload": {
-                                    "type": "user_message",
-                                    "message": rendered_text.unwrap_or_default(),
-                                    "images": images,
-                                    "local_images": [],
-                                    "text_elements": [],
-                                }
-                            }),
-                        )?;
-                    }
-                    if let Some(turn) = &mut active_turn {
-                        turn.last_timestamp = Some(timestamp);
-                    }
-                    continue;
+                let images: Vec<String> =
+                    message.blocks.iter().filter_map(codex_image_url).collect();
+                let text = render_message_text(message);
+                if text.is_some() || !images.is_empty() {
+                    write_json_line(
+                        &mut file,
+                        &json!({
+                            "timestamp": at,
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "user_message",
+                                "message": text.unwrap_or_default(),
+                                "images": images,
+                                "local_images": [],
+                                "text_elements": [],
+                            }
+                        }),
+                    )?;
                 }
-
-                if message.role != "developer" && active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, timestamp)?);
+            }
+            SessionEvent::Message(message) => {
+                // Developer messages carry repo instructions rather than a turn
+                // of their own, so they never open one.
+                if message.role != "developer" {
+                    ensure_turn(&mut file, &mut active_turn, timestamp)?;
                 }
 
                 if message.role == "assistant"
-                    && let Some(text) = rendered_text.clone()
+                    && let Some(text) = render_message_text(message)
                 {
                     write_json_line(
                         &mut file,
                         &json!({
-                            "timestamp": event_timestamp(message.timestamp, updated_at),
+                            "timestamp": at,
                             "type": "event_msg",
                             "payload": {
                                 "type": "agent_message",
@@ -492,32 +362,23 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }),
                     )?;
                     if let Some(turn) = &mut active_turn {
-                        turn.last_agent_message = rendered_text;
+                        turn.last_agent_message = Some(text);
                     }
                 }
 
-                write_message_response_item(&mut file, message, updated_at)?;
-                if let Some(turn) = &mut active_turn {
-                    turn.last_timestamp = Some(timestamp);
-                }
+                write_message_response_item(&mut file, message, &at)?;
             }
             SessionEvent::Reasoning(reasoning) => {
-                let timestamp = reasoning.timestamp.unwrap_or(updated_at);
-                if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, timestamp)?);
-                }
+                ensure_turn(&mut file, &mut active_turn, timestamp)?;
 
-                let summary_text = render_reasoning_text(reasoning);
+                let summary_text = join_non_empty(reasoning.summary.iter().map(String::as_str));
                 if !summary_text.is_empty() {
                     write_json_line(
                         &mut file,
                         &json!({
-                            "timestamp": event_timestamp(reasoning.timestamp, updated_at),
+                            "timestamp": at,
                             "type": "event_msg",
-                            "payload": {
-                                "type": "agent_reasoning",
-                                "text": summary_text,
-                            }
+                            "payload": { "type": "agent_reasoning", "text": summary_text }
                         }),
                     )?;
                 }
@@ -525,7 +386,7 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                 write_json_line(
                     &mut file,
                     &json!({
-                        "timestamp": event_timestamp(reasoning.timestamp, updated_at),
+                        "timestamp": at,
                         "type": "response_item",
                         "payload": {
                             "type": "reasoning",
@@ -537,19 +398,13 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
-                if let Some(turn) = &mut active_turn {
-                    turn.last_timestamp = Some(timestamp);
-                }
             }
             SessionEvent::ToolCall(call) => {
-                let timestamp = call.timestamp.unwrap_or(updated_at);
-                if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, timestamp)?);
-                }
+                ensure_turn(&mut file, &mut active_turn, timestamp)?;
                 write_json_line(
                     &mut file,
                     &json!({
-                        "timestamp": event_timestamp(call.timestamp, updated_at),
+                        "timestamp": at,
                         "type": "response_item",
                         "payload": {
                             "type": "function_call",
@@ -560,19 +415,13 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
-                if let Some(turn) = &mut active_turn {
-                    turn.last_timestamp = Some(timestamp);
-                }
             }
             SessionEvent::ToolResult(result) => {
-                let timestamp = result.timestamp.unwrap_or(updated_at);
-                if active_turn.is_none() {
-                    active_turn = Some(start_turn(&mut file, timestamp)?);
-                }
+                ensure_turn(&mut file, &mut active_turn, timestamp)?;
                 write_json_line(
                     &mut file,
                     &json!({
-                        "timestamp": event_timestamp(result.timestamp, updated_at),
+                        "timestamp": at,
                         "type": "response_item",
                         "payload": {
                             "type": "function_call_output",
@@ -581,228 +430,121 @@ pub fn write(session: &UniversalSession, output: &Path) -> Result<PathBuf> {
                         }
                     }),
                 )?;
-                if let Some(turn) = &mut active_turn {
-                    turn.last_timestamp = Some(timestamp);
-                }
             }
+        }
+
+        if let Some(turn) = &mut active_turn {
+            turn.last_timestamp = Some(timestamp);
         }
     }
 
     close_turn(&mut file, &mut active_turn, updated_at)?;
 
-    let thread_name = exported_codex_thread_name(session, &session_id);
-
-    if let Some(session_index) = &materialization.session_index {
-        if let Some(parent) = session_index.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
+    if native_store {
+        let title = derive_title(session).unwrap_or_else(|| session_id.clone());
+        let index_path = output.join("session_index.jsonl");
         let mut index = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(session_index)
-            .with_context(|| format!("failed to open {}", session_index.display()))?;
-
+            .open(&index_path)
+            .with_context(|| format!("failed to open {}", index_path.display()))?;
         write_json_line(
             &mut index,
             &json!({
                 "id": session_id,
-                "thread_name": thread_name.clone(),
-                "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "thread_name": title,
+                "updated_at": rfc3339(updated_at),
             }),
         )?;
-    }
 
-    if output.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
         register_thread_in_sqlite(
             output,
             session,
-            &materialization.session_file,
+            &session_file,
             &session_id,
-            &thread_name,
+            &title,
             created_at,
             updated_at,
         )?;
     }
 
-    Ok(materialization.session_file)
+    Ok(session_file)
 }
 
-fn plan_output(session: &UniversalSession, output: &Path) -> CodexMaterialization {
-    if output.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-        return CodexMaterialization {
-            session_file: output.to_path_buf(),
-            session_index: None,
-        };
+fn session_meta_payload(
+    session: &UniversalSession,
+    session_id: &str,
+    cwd: &Path,
+    created_at: DateTime<Utc>,
+) -> Value {
+    let metadata = &session.metadata;
+    let mut payload = json!({
+        "id": session_id,
+        "session_id": session_id,
+        "timestamp": rfc3339(created_at),
+        "cwd": cwd.display().to_string(),
+        "originator": extra_string(metadata, "codex_originator")
+            .unwrap_or_else(|| "transession".to_string()),
+        "cli_version": super::codex_cli_version(),
+        "source": metadata.extra.get("codex_source").cloned().unwrap_or_else(|| json!("cli")),
+        "model_provider": CODEX_MODEL_PROVIDER,
+        "thread_source": "user",
+        "history_mode": "legacy",
+    });
+
+    if let Some(instructions) = extra_string(metadata, "codex_base_instructions") {
+        payload["base_instructions"] = json!({ "text": instructions });
+    }
+    // An imported Codex session carries the original git block; sessions
+    // arriving from Claude only know the branch name, which is still enough for
+    // the resume picker's branch column.
+    match (metadata.extra.get("codex_git"), &metadata.git_branch) {
+        (Some(git), _) => payload["git"] = git.clone(),
+        (None, Some(branch)) => payload["git"] = json!({ "branch": branch }),
+        (None, None) => {}
     }
 
+    payload
+}
+
+fn time_bounds(session: &UniversalSession) -> (DateTime<Utc>, DateTime<Utc>) {
+    let event_times = || session.events.iter().filter_map(SessionEvent::timestamp);
     let created_at = session
         .metadata
         .created_at
-        .unwrap_or_else(Utc::now)
-        .with_timezone(&Local);
-    let session_id = codex_session_id(&session.metadata.session_id);
-    let relative = PathBuf::from("sessions")
-        .join(format!("{:04}", created_at.year()))
-        .join(format!("{:02}", created_at.month()))
-        .join(format!("{:02}", created_at.day()))
-        .join(format!(
-            "rollout-{}-{}.jsonl",
-            created_at.format("%Y-%m-%dT%H-%M-%S"),
-            session_id
-        ));
+        .or_else(|| event_times().min())
+        .unwrap_or_else(Utc::now);
+    let updated_at = session
+        .metadata
+        .updated_at
+        .or_else(|| event_times().max())
+        .unwrap_or(created_at);
+    (created_at, updated_at)
+}
 
-    CodexMaterialization {
-        session_file: output.join(relative),
-        session_index: Some(output.join("session_index.jsonl")),
+struct ActiveTurn {
+    turn_id: String,
+    last_agent_message: Option<String>,
+    last_timestamp: Option<DateTime<Utc>>,
+}
+
+fn ensure_turn(
+    file: &mut impl Write,
+    active_turn: &mut Option<ActiveTurn>,
+    timestamp: DateTime<Utc>,
+) -> Result<()> {
+    if active_turn.is_none() {
+        *active_turn = Some(start_turn(file, timestamp)?);
     }
-}
-
-fn normalize_block(value: &Value) -> ContentBlock {
-    let kind = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("text")
-        .to_string();
-    let text = ["text", "thinking", "content"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str))
-        .map(str::to_string);
-
-    let mut object = value.as_object().cloned().unwrap_or_default();
-    object.remove("type");
-    object.remove("text");
-    object.remove("thinking");
-    object.remove("content");
-    let data = (!object.is_empty()).then_some(Value::Object(object));
-
-    ContentBlock { kind, text, data }
-}
-
-fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-fn parse_jsonish(value: &str) -> Value {
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
-}
-
-fn json_to_string(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
-    }
-}
-
-fn event_timestamp(timestamp: Option<DateTime<Utc>>, fallback: DateTime<Utc>) -> String {
-    timestamp
-        .unwrap_or(fallback)
-        .to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-
-fn write_json_line(file: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *file, value).context("failed to encode JSONL line")?;
-    file.write_all(b"\n").context("failed to write newline")
-}
-
-fn update_time_bounds(metadata: &mut SessionMetadata, timestamp: Option<DateTime<Utc>>) {
-    let Some(timestamp) = timestamp else {
-        return;
-    };
-    metadata.created_at = Some(match metadata.created_at {
-        Some(current) => current.min(timestamp),
-        None => timestamp,
-    });
-    metadata.updated_at = Some(match metadata.updated_at {
-        Some(current) => current.max(timestamp),
-        None => timestamp,
-    });
-}
-
-fn derive_title(session: &UniversalSession) -> Option<String> {
-    if let Some(title) = &session.metadata.title {
-        return Some(title.clone());
-    }
-
-    session.events.iter().find_map(|event| {
-        let SessionEvent::Message(message) = event else {
-            return None;
-        };
-        if message.role != "user" {
-            return None;
-        }
-        message
-            .blocks
-            .iter()
-            .filter_map(|block| block.text.as_deref())
-            .map(collapse_whitespace)
-            .find(|text| !text.is_empty())
-    })
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.chars().take(80).collect()
-}
-
-fn copy_if_present(
-    payload: &serde_json::Map<String, Value>,
-    metadata: &mut SessionMetadata,
-    input_key: &str,
-    output_key: &str,
-) {
-    if let Some(value) = payload.get(input_key) {
-        metadata.extra.insert(output_key.to_string(), value.clone());
-    }
-}
-
-/// Rebuild the `git` block for an exported session.
-///
-/// An imported Codex session carries the original block; sessions arriving from
-/// Claude only know the branch name, which is still enough for the resume
-/// picker's branch column.
-fn codex_git_info(metadata: &SessionMetadata) -> Option<Value> {
-    match (metadata.extra.get("codex_git"), &metadata.git_branch) {
-        (Some(git), _) => Some(git.clone()),
-        (None, Some(branch)) => Some(json!({ "branch": branch })),
-        (None, None) => None,
-    }
-}
-
-fn extra_string(metadata: &SessionMetadata, key: &str) -> Option<String> {
-    metadata
-        .extra
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn codex_session_id(candidate: &str) -> String {
-    if Uuid::parse_str(candidate).is_ok() {
-        candidate.to_string()
-    } else {
-        Uuid::now_v7().to_string()
-    }
-}
-
-fn exported_codex_thread_name(session: &UniversalSession, session_id: &str) -> String {
-    if session.metadata.source_format == Some(SessionFormat::Codex) {
-        return derive_title(session).unwrap_or_else(|| session_id.to_string());
-    }
-    session_id.to_string()
+    Ok(())
 }
 
 fn start_turn(file: &mut impl Write, timestamp: DateTime<Utc>) -> Result<ActiveTurn> {
     let turn_id = Uuid::now_v7().to_string();
-    let rendered_timestamp = timestamp.to_rfc3339_opts(SecondsFormat::Millis, true);
-
     write_json_line(
         file,
         &json!({
-            "timestamp": rendered_timestamp,
+            "timestamp": rfc3339(timestamp),
             "type": "event_msg",
             "payload": {
                 "type": "task_started",
@@ -832,7 +574,7 @@ fn close_turn(
     write_json_line(
         file,
         &json!({
-            "timestamp": event_timestamp(turn.last_timestamp, fallback),
+            "timestamp": rfc3339(turn.last_timestamp.unwrap_or(fallback)),
             "type": "event_msg",
             "payload": {
                 "type": "task_complete",
@@ -846,7 +588,7 @@ fn close_turn(
 fn write_message_response_item(
     file: &mut impl Write,
     message: &MessageEvent,
-    fallback: DateTime<Utc>,
+    timestamp: &str,
 ) -> Result<()> {
     let blocks = message
         .blocks
@@ -856,16 +598,15 @@ fn write_message_response_item(
             if let Some(text) = &block.text {
                 object.insert(
                     "type".to_string(),
-                    Value::String(codex_block_kind(&message.role, &block.kind).to_string()),
+                    codex_block_kind(&message.role, &block.kind).into(),
                 );
-                object.insert("text".to_string(), Value::String(text.clone()));
+                object.insert("text".to_string(), text.clone().into());
                 if let Some(Value::Object(extra)) = &block.data {
                     object.extend(extra.clone());
                 }
             } else {
-                let image_url = codex_image_url(block)?;
-                object.insert("type".to_string(), Value::String("input_image".to_string()));
-                object.insert("image_url".to_string(), Value::String(image_url));
+                object.insert("type".to_string(), "input_image".into());
+                object.insert("image_url".to_string(), codex_image_url(block)?.into());
             }
             Some(Value::Object(object))
         })
@@ -878,7 +619,7 @@ fn write_message_response_item(
     write_json_line(
         file,
         &json!({
-            "timestamp": event_timestamp(message.timestamp, fallback),
+            "timestamp": timestamp,
             "type": "response_item",
             "payload": {
                 "type": "message",
@@ -917,48 +658,56 @@ fn codex_image_url(block: &ContentBlock) -> Option<String> {
 }
 
 fn render_message_text(message: &MessageEvent) -> Option<String> {
-    let text = message
-        .blocks
-        .iter()
-        .filter_map(|block| block.text.as_deref())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = join_non_empty(
+        message
+            .blocks
+            .iter()
+            .filter_map(|block| block.text.as_deref()),
+    );
     (!text.is_empty()).then_some(text)
 }
 
-fn render_reasoning_text(reasoning: &ReasoningEvent) -> String {
-    reasoning
-        .summary
-        .iter()
-        .map(String::as_str)
+fn join_non_empty<'a>(parts: impl Iterator<Item = &'a str>) -> String {
+    parts
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-fn codex_block_kind(role: &str, original_kind: &str) -> &'static str {
-    match original_kind {
+fn codex_block_kind(role: &str, kind: &str) -> &'static str {
+    match kind {
         "input_text" => "input_text",
         "output_text" => "output_text",
-        _ => {
-            if role == "assistant" {
-                "output_text"
-            } else {
-                "input_text"
-            }
-        }
+        _ if role == "assistant" => "output_text",
+        _ => "input_text",
     }
 }
 
+fn extra_string(metadata: &SessionMetadata, key: &str) -> Option<String> {
+    metadata
+        .extra
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn codex_session_id(candidate: &str) -> String {
+    if Uuid::parse_str(candidate).is_ok() {
+        candidate.to_string()
+    } else {
+        Uuid::now_v7().to_string()
+    }
+}
+
+/// Codex lists resumable threads from `state_5.sqlite` rather than the rollout
+/// files, so a translated session stays invisible until it has a row here.
 fn register_thread_in_sqlite(
     codex_root: &Path,
     session: &UniversalSession,
     session_file: &Path,
     session_id: &str,
-    thread_name: &str,
+    title: &str,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 ) -> Result<()> {
@@ -969,8 +718,7 @@ fn register_thread_in_sqlite(
 
     let connection = Connection::open(&sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
-    let title = thread_name.to_string();
-    let first_user_message = first_user_message(session).unwrap_or_else(|| title.clone());
+    let first_user_message = first_user_text(session).unwrap_or_else(|| title.to_string());
     let cwd = session
         .metadata
         .cwd
@@ -982,11 +730,9 @@ fn register_thread_in_sqlite(
         .extra
         .get("codex_sandbox_policy")
         .map(json_to_string)
-        .unwrap_or_else(|| "{\"type\":\"workspace-write\"}".to_string());
+        .unwrap_or_else(|| json!({ "type": "workspace-write" }).to_string());
     let approval_mode = extra_string(&session.metadata, "codex_approval_policy")
         .unwrap_or_else(|| "on-request".to_string());
-    let model_provider = CODEX_MODEL_PROVIDER;
-    let git_branch = session.metadata.git_branch.clone();
     let has_user_event = session
         .events
         .iter()
@@ -996,27 +742,10 @@ fn register_thread_in_sqlite(
     connection
         .execute(
             "INSERT INTO threads (
-                id,
-                rollout_path,
-                created_at,
-                updated_at,
-                source,
-                model_provider,
-                cwd,
-                title,
-                sandbox_policy,
-                approval_mode,
-                tokens_used,
-                has_user_event,
-                archived,
-                git_sha,
-                git_branch,
-                git_origin_url,
-                cli_version,
-                first_user_message,
-                agent_nickname,
-                agent_role,
-                memory_mode
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, git_sha,
+                git_branch, git_origin_url, cli_version, first_user_message, agent_nickname,
+                agent_role, memory_mode
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, 0, NULL, ?12, NULL, ?13, ?14, NULL, NULL, 'enabled'
             )
@@ -1040,41 +769,30 @@ fn register_thread_in_sqlite(
                 created_at.timestamp(),
                 updated_at.timestamp(),
                 "cli",
-                model_provider,
+                CODEX_MODEL_PROVIDER,
                 cwd,
                 title,
                 sandbox_policy,
                 approval_mode,
                 has_user_event,
-                git_branch,
+                session.metadata.git_branch,
                 super::codex_cli_version(),
                 first_user_message,
             ],
         )
-        .with_context(|| format!("failed to register thread {} in {}", session_id, sqlite_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to register thread {session_id} in {}",
+                sqlite_path.display()
+            )
+        })?;
 
-    // Codex 0.144+ hides rows without a preview; older state DBs lack these columns.
+    // Codex 0.144+ hides rows without a preview; older state DBs lack these
+    // columns, so a failure here is not fatal.
     let _ = connection.execute(
         "UPDATE threads SET preview = ?1, thread_source = 'user', history_mode = 'legacy' WHERE id = ?2",
         params![first_user_message, session_id],
     );
 
     Ok(())
-}
-
-fn first_user_message(session: &UniversalSession) -> Option<String> {
-    session.events.iter().find_map(|event| {
-        let SessionEvent::Message(message) = event else {
-            return None;
-        };
-        if message.role != "user" {
-            return None;
-        }
-        message
-            .blocks
-            .iter()
-            .filter_map(|block| block.text.as_deref())
-            .map(collapse_whitespace)
-            .find(|text| !text.is_empty())
-    })
 }

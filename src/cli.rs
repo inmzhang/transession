@@ -9,8 +9,10 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::formats::{self, default_output_root, load_session, materialize, resolve_input};
-use crate::ir::{SessionEvent, SessionFormat, SourceFormat, UniversalSession};
+use crate::formats::{
+    self, default_output_root, load_resolved, load_session, materialize, resolve_input,
+};
+use crate::ir::{SessionEvent, SessionFormat, UniversalSession};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -25,12 +27,14 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// Source format; autodetected when omitted.
     #[arg(long, value_enum)]
-    from: Option<SourceFormat>,
+    from: Option<SessionFormat>,
 
     #[arg(long, value_enum)]
     to: Option<SessionFormat>,
 
+    /// Target store root, or a `.jsonl` file for a standalone session.
     #[arg(long)]
     output: Option<PathBuf>,
 
@@ -54,8 +58,8 @@ enum Command {
 #[derive(Debug, Args)]
 struct InspectArgs {
     input: PathBuf,
-    #[arg(long, value_enum, default_value = "auto")]
-    from: SourceFormat,
+    #[arg(long, value_enum)]
+    from: Option<SessionFormat>,
     #[arg(long)]
     json: bool,
 }
@@ -64,8 +68,8 @@ struct InspectArgs {
 struct ImportArgs {
     input: PathBuf,
     output: PathBuf,
-    #[arg(long, value_enum, default_value = "auto")]
-    from: SourceFormat,
+    #[arg(long, value_enum)]
+    from: Option<SessionFormat>,
 }
 
 #[derive(Debug, Args)]
@@ -82,8 +86,8 @@ struct ExportArgs {
 struct ConvertArgs {
     input: PathBuf,
     output: PathBuf,
-    #[arg(long, value_enum, default_value = "auto")]
-    from: SourceFormat,
+    #[arg(long, value_enum)]
+    from: Option<SessionFormat>,
     #[arg(long, value_enum)]
     to: SessionFormat,
     #[arg(long)]
@@ -104,12 +108,11 @@ pub fn run() -> Result<()> {
 
 fn quick_convert(cli: Cli) -> Result<()> {
     let input = cli.input.context("missing input session id or path")?;
-    let from = cli.from.unwrap_or(SourceFormat::Auto);
     let to = cli
         .to
         .context("missing --to; example: transession --from claude --to codex <SESSION_ID>")?;
 
-    let mut session = load_session(&input, from)
+    let mut session = load_session(&input, cli.from)
         .with_context(|| format!("failed to load source session {}", input.display()))?;
 
     if to == SessionFormat::Ir && cli.output.is_none() {
@@ -122,59 +125,67 @@ fn quick_convert(cli: Cli) -> Result<()> {
     };
     let wrote_standalone_jsonl = output.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
 
-    maybe_rekey_session(
+    rekey_session(
         &mut session,
         !cli.keep_session_id && to != SessionFormat::Ir,
         to,
     );
     let path = materialize(&session, to, &output)?;
 
-    println!(
-        "created {} session: {}",
-        format_name(to),
-        session.metadata.session_id
-    );
+    println!("created {to} session: {}", session.metadata.session_id);
     println!("stored at: {}", path.display());
-    if let Some(hint) = resume_hint(to, &session.metadata.session_id) {
-        println!("resume with: {hint}");
+    match to {
+        SessionFormat::Codex => {
+            println!("resume with: codex resume {}", session.metadata.session_id)
+        }
+        SessionFormat::Claude => println!("resume with: claude -r {}", session.metadata.session_id),
+        SessionFormat::Ir => {}
     }
-    maybe_open_session(
-        to,
-        &session.metadata.session_id,
-        &output,
-        session.metadata.cwd.as_deref(),
-        wrote_standalone_jsonl,
-        cli.no_open,
-    )?;
+
+    if !cli.no_open && to != SessionFormat::Ir {
+        if wrote_standalone_jsonl {
+            bail!(
+                "automatic open requires writing into a native Codex/Claude home directory, not a standalone .jsonl file; pass --no-open to keep the conversion only"
+            );
+        }
+        open_session(
+            to,
+            &session.metadata.session_id,
+            &output,
+            session.metadata.cwd.as_deref(),
+        )?;
+    }
+
     Ok(())
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {
-    let detected = resolve_input(&args.input, args.from)?.format;
-    let session = load_session(&args.input, args.from)?;
+    let resolved = resolve_input(&args.input, args.from)?;
+    let session = load_resolved(&resolved)?;
     let summary = summarize(&session);
 
     if args.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "detected_format": detected,
+                "detected_format": resolved.format,
                 "summary": summary,
             }))?
         );
-    } else {
-        println!("format: {}", format_name(detected));
-        println!("session_id: {}", session.metadata.session_id);
-        if let Some(title) = &session.metadata.title {
-            println!("title: {title}");
-        }
-        if let Some(cwd) = &session.metadata.cwd {
-            println!("cwd: {}", cwd.display());
-        }
-        println!("events: {}", session.events.len());
-        for (kind, count) in summary {
-            println!("{kind}: {count}");
-        }
+        return Ok(());
+    }
+
+    println!("format: {}", resolved.format);
+    println!("session_id: {}", session.metadata.session_id);
+    if let Some(title) = &session.metadata.title {
+        println!("title: {title}");
+    }
+    if let Some(cwd) = &session.metadata.cwd {
+        println!("cwd: {}", cwd.display());
+    }
+    println!("events: {}", session.events.len());
+    for (kind, count) in summary {
+        println!("{kind}: {count}");
     }
 
     Ok(())
@@ -189,18 +200,22 @@ fn import(args: ImportArgs) -> Result<()> {
 
 fn export(args: ExportArgs) -> Result<()> {
     let mut session = formats::load_ir(&args.input)?;
-    maybe_rekey_session(&mut session, args.new_session_id, args.to);
-    let path = materialize(&session, args.to, &args.output)?;
-    println!("{}", path.display());
+    rekey_session(&mut session, args.new_session_id, args.to);
+    println!(
+        "{}",
+        materialize(&session, args.to, &args.output)?.display()
+    );
     Ok(())
 }
 
 fn convert(args: ConvertArgs) -> Result<()> {
     let mut session = load_session(&args.input, args.from)
         .with_context(|| format!("failed to load source session {}", args.input.display()))?;
-    maybe_rekey_session(&mut session, args.new_session_id, args.to);
-    let path = materialize(&session, args.to, &args.output)?;
-    println!("{}", path.display());
+    rekey_session(&mut session, args.new_session_id, args.to);
+    println!(
+        "{}",
+        materialize(&session, args.to, &args.output)?.display()
+    );
     Ok(())
 }
 
@@ -218,109 +233,51 @@ fn summarize(session: &UniversalSession) -> BTreeMap<&'static str, usize> {
     counts
 }
 
-fn maybe_rekey_session(
-    session: &mut UniversalSession,
-    new_session_id: bool,
-    target: SessionFormat,
-) {
-    if !new_session_id {
-        if target == SessionFormat::Codex && Uuid::parse_str(&session.metadata.session_id).is_err()
-        {
-            session.metadata.session_id = Uuid::now_v7().to_string();
-        }
-        if target == SessionFormat::Claude && Uuid::parse_str(&session.metadata.session_id).is_err()
-        {
-            session.metadata.session_id = Uuid::new_v4().to_string();
-        }
+/// Both native stores key their session files by UUID, so a non-UUID id is
+/// always replaced. Codex additionally sorts its resume picker by id, which
+/// wants the time-ordered v7 flavour.
+fn rekey_session(session: &mut UniversalSession, forced: bool, target: SessionFormat) {
+    let needs_uuid =
+        target != SessionFormat::Ir && Uuid::parse_str(&session.metadata.session_id).is_err();
+    if !forced && !needs_uuid {
         return;
     }
 
     session.metadata.session_id = match target {
-        SessionFormat::Ir => Uuid::new_v4().to_string(),
-        SessionFormat::Codex => Uuid::now_v7().to_string(),
-        SessionFormat::Claude => Uuid::new_v4().to_string(),
-    };
-}
-
-fn format_name(format: SessionFormat) -> &'static str {
-    match format {
-        SessionFormat::Ir => "ir",
-        SessionFormat::Codex => "codex",
-        SessionFormat::Claude => "claude",
+        SessionFormat::Codex => Uuid::now_v7(),
+        SessionFormat::Ir | SessionFormat::Claude => Uuid::new_v4(),
     }
+    .to_string();
 }
 
-fn resume_hint(format: SessionFormat, session_id: &str) -> Option<String> {
-    match format {
-        SessionFormat::Codex => Some(format!("codex resume {session_id}")),
-        SessionFormat::Claude => Some(format!("claude -r {session_id}")),
-        SessionFormat::Ir => None,
-    }
-}
-
-fn maybe_open_session(
+fn open_session(
     format: SessionFormat,
     session_id: &str,
-    output_root: &std::path::Path,
-    session_cwd: Option<&std::path::Path>,
-    wrote_standalone_jsonl: bool,
-    no_open: bool,
+    output_root: &Path,
+    session_cwd: Option<&Path>,
 ) -> Result<()> {
-    if no_open || format == SessionFormat::Ir {
-        return Ok(());
+    let installed_home = match format {
+        SessionFormat::Codex => formats::codex_root()?,
+        SessionFormat::Claude => formats::claude_root()?,
+        SessionFormat::Ir => bail!("IR has no runtime home"),
+    };
+    let redirected = !same_path(&installed_home, output_root);
+    if redirected {
+        link_login_state(format, &installed_home, output_root)?;
     }
-
-    if wrote_standalone_jsonl {
-        bail!(
-            "automatic open requires writing into a native Codex/Claude home directory, not a standalone .jsonl file; pass --no-open to keep the conversion only"
-        );
-    }
-
-    let mut command = resume_command(format, session_id, output_root, session_cwd)?;
-    println!("opening {} session...", format_name(format));
-    std::io::stdout()
-        .flush()
-        .context("failed to flush stdout")?;
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to launch {}", format_name(format)))?;
-    if !status.success() {
-        bail!(
-            "{} exited with status {}",
-            format_name(format),
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string())
-        );
-    }
-
-    Ok(())
-}
-
-fn resume_command(
-    format: SessionFormat,
-    session_id: &str,
-    output_root: &std::path::Path,
-    session_cwd: Option<&std::path::Path>,
-) -> Result<ProcessCommand> {
-    prepare_runtime_home(format, output_root)?;
 
     let mut command = match format {
         SessionFormat::Codex => {
-            let mut cmd = ProcessCommand::new(formats::codex_binary());
-            cmd.arg("resume").arg(session_id);
-            cmd
+            let mut command = ProcessCommand::new(formats::codex_binary());
+            command.arg("resume").arg(session_id);
+            command
         }
-        SessionFormat::Claude => {
-            let mut cmd = ProcessCommand::new(formats::claude_binary());
-            cmd.arg("-r").arg(session_id);
-            cmd
+        _ => {
+            let mut command = ProcessCommand::new(formats::claude_binary());
+            command.arg("-r").arg(session_id);
+            command
         }
-        SessionFormat::Ir => bail!("cannot open IR directly"),
     };
-
     command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -331,16 +288,15 @@ fn resume_command(
     // from `~/.claude.json` to `<dir>/.claude.json`, so pointing it at the
     // default `~/.claude` would hand Claude Code an empty config and force a
     // fresh login.
-    if !same_path(&installed_home(format)?, output_root) {
+    if redirected {
         match format {
             SessionFormat::Codex => {
                 command.env("CODEX_HOME", output_root);
             }
-            SessionFormat::Claude => {
+            _ => {
                 command.env("CLAUDE_CONFIG_DIR", output_root);
                 command.env("CLAUDE_HOME", output_root);
             }
-            SessionFormat::Ir => {}
         }
     }
 
@@ -348,7 +304,19 @@ fn resume_command(
         command.current_dir(cwd);
     }
 
-    Ok(command)
+    println!("opening {format} session...");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch {format}"))?;
+    if !status.success() {
+        bail!("{format} exited with {status}");
+    }
+
+    Ok(())
 }
 
 /// Custom output roots start out empty, so the launched CLI would ask the user
@@ -359,33 +327,30 @@ fn resume_command(
 /// are linked rather than copied so a token refresh in the temporary home stays
 /// valid in the installed one; the trade-off is that the temporary home also
 /// writes its project state back into the installed config.
-fn prepare_runtime_home(format: SessionFormat, output_root: &Path) -> Result<()> {
+fn link_login_state(
+    format: SessionFormat,
+    installed_home: &Path,
+    output_root: &Path,
+) -> Result<()> {
     let files: &[&str] = match format {
         SessionFormat::Codex => &["auth.json"],
         SessionFormat::Claude => &[".credentials.json", ".claude.json"],
         SessionFormat::Ir => return Ok(()),
     };
 
-    let installed_home = installed_home(format)?;
-    if same_path(&installed_home, output_root) {
-        return Ok(());
-    }
-
     for file in files {
-        link_runtime_file(&installed_home.join(file), &output_root.join(file))?;
-    }
+        let source = installed_home.join(file);
+        let target = output_root.join(file);
+        if !source.is_file() || target.exists() {
+            continue;
+        }
 
-    Ok(())
-}
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&source, &target);
+        #[cfg(not(unix))]
+        let linked = fs::copy(&source, &target).map(|_| ());
 
-fn link_runtime_file(source: &Path, target: &Path) -> Result<()> {
-    if !source.is_file() || target.exists() {
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(source, target).with_context(|| {
+        linked.with_context(|| {
             format!(
                 "failed to link {} to {}",
                 source.display(),
@@ -394,35 +359,13 @@ fn link_runtime_file(source: &Path, target: &Path) -> Result<()> {
         })?;
     }
 
-    #[cfg(not(unix))]
-    {
-        fs::copy(source, target).with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                source.display(),
-                target.display()
-            )
-        })?;
-    }
-
     Ok(())
 }
 
-fn installed_home(format: SessionFormat) -> Result<PathBuf> {
-    match format {
-        SessionFormat::Codex => formats::codex_root(),
-        SessionFormat::Claude => formats::claude_root(),
-        SessionFormat::Ir => bail!("IR has no runtime home"),
-    }
-}
-
 fn same_path(lhs: &Path, rhs: &Path) -> bool {
-    if lhs == rhs {
-        return true;
-    }
-
-    match (fs::canonicalize(lhs), fs::canonicalize(rhs)) {
-        (Ok(lhs), Ok(rhs)) => lhs == rhs,
-        _ => false,
-    }
+    lhs == rhs
+        || matches!(
+            (fs::canonicalize(lhs), fs::canonicalize(rhs)),
+            (Ok(lhs), Ok(rhs)) if lhs == rhs
+        )
 }

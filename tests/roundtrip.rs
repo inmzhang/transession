@@ -1,14 +1,21 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rusqlite::Connection;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use transession::formats::{detect_format, load_session, materialize};
 use transession::ir::{
-    ContentBlock, MessageEvent, ReasoningEvent, SessionEvent, SessionFormat, SourceFormat,
-    UniversalSession,
+    ContentBlock, MessageEvent, ReasoningEvent, SessionEvent, SessionFormat, UniversalSession,
 };
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(name)
+}
 
 fn is_semver(value: &str) -> bool {
     let parts: Vec<&str> = value.split('.').collect();
@@ -19,20 +26,70 @@ fn is_semver(value: &str) -> bool {
             .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn fixture(name: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(name)
+/// Columns every supported Codex release has. `state_db` appends the newer ones
+/// on request so one test still exercises the older-schema fallback.
+const THREAD_COLUMNS: &str = "id TEXT PRIMARY KEY,
+    rollout_path TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    model_provider TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sandbox_policy TEXT NOT NULL,
+    approval_mode TEXT NOT NULL,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    has_user_event INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
+    git_sha TEXT,
+    git_branch TEXT,
+    git_origin_url TEXT,
+    cli_version TEXT NOT NULL DEFAULT '',
+    first_user_message TEXT NOT NULL DEFAULT '',
+    agent_nickname TEXT,
+    agent_role TEXT,
+    memory_mode TEXT NOT NULL DEFAULT 'enabled'";
+
+const PREVIEW_COLUMNS: &str = ",
+    thread_source TEXT,
+    preview TEXT NOT NULL DEFAULT '',
+    history_mode TEXT NOT NULL DEFAULT 'legacy'";
+
+fn state_db(root: &Path, extra_columns: &str) -> Connection {
+    let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE threads ({THREAD_COLUMNS}{extra_columns});"
+        ))
+        .unwrap();
+    connection
+}
+
+/// Stand-in for `codex`/`claude` that records how `transession` invoked it.
+fn fake_cli(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+fn jsonl(path: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[test]
 fn detects_and_imports_codex_fixture() {
     let path = fixture("codex_sample.jsonl");
-    let format = detect_format(&path).unwrap();
-    assert_eq!(format, SessionFormat::Codex);
+    assert_eq!(detect_format(&path).unwrap(), SessionFormat::Codex);
 
-    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    let session = load_session(&path, None).unwrap();
     assert_eq!(
         session.metadata.session_id,
         "019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"
@@ -54,21 +111,16 @@ fn detects_and_imports_codex_fixture() {
 #[test]
 fn detects_and_imports_current_codex_fixture() {
     let path = fixture("codex_current_sample.jsonl");
-    let format = detect_format(&path).unwrap();
-    assert_eq!(format, SessionFormat::Codex);
+    assert_eq!(detect_format(&path).unwrap(), SessionFormat::Codex);
 
-    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    let session = load_session(&path, None).unwrap();
     assert_eq!(
         session.metadata.session_id,
         "019d5294-7fd5-7e21-bcca-32362218c185"
     );
     assert_eq!(session.metadata.model.as_deref(), Some("gpt-5.6"));
     assert_eq!(
-        session
-            .metadata
-            .extra
-            .get("codex_model_provider")
-            .and_then(|value| value.as_str()),
+        session.metadata.extra["codex_model_provider"].as_str(),
         Some("openai")
     );
     assert_eq!(
@@ -86,14 +138,9 @@ fn detects_and_imports_current_codex_fixture() {
         session
             .events
             .iter()
-            .any(|event| matches!(event, SessionEvent::ToolCall(_)))
-    );
-    assert!(
-        session
-            .events
-            .iter()
             .any(|event| matches!(event, SessionEvent::ToolResult(_)))
     );
+    // Freeform tools spell their payload as a plain (non-JSON) string.
     assert!(session.events.iter().any(|event| {
         matches!(event, SessionEvent::ToolCall(call) if call.name == "exec" && call.arguments.is_string())
     }));
@@ -102,37 +149,30 @@ fn detects_and_imports_current_codex_fixture() {
 #[test]
 fn detects_and_imports_claude_fixture() {
     let path = fixture("claude_sample.jsonl");
-    let format = detect_format(&path).unwrap();
-    assert_eq!(format, SessionFormat::Claude);
+    assert_eq!(detect_format(&path).unwrap(), SessionFormat::Claude);
 
-    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    let session = load_session(&path, None).unwrap();
     assert_eq!(
         session.metadata.session_id,
         "d89e26cd-11f2-47e8-bea5-a73ad5458483"
     );
-    assert!(
-        session
-            .events
-            .iter()
-            .any(|event| matches!(event, SessionEvent::Reasoning(_)))
-    );
+    // A single assistant entry splits into reasoning followed by its message.
+    assert!(matches!(session.events[1], SessionEvent::Reasoning(_)));
+    assert!(matches!(session.events[2], SessionEvent::Message(_)));
     assert!(
         session
             .events
             .iter()
             .any(|event| matches!(event, SessionEvent::ToolCall(_)))
     );
-    assert!(matches!(session.events[1], SessionEvent::Reasoning(_)));
-    assert!(matches!(session.events[2], SessionEvent::Message(_)));
 }
 
 #[test]
 fn detects_and_imports_current_claude_fixture() {
     let path = fixture("claude_current_sample.jsonl");
-    let format = detect_format(&path).unwrap();
-    assert_eq!(format, SessionFormat::Claude);
+    assert_eq!(detect_format(&path).unwrap(), SessionFormat::Claude);
 
-    let session = load_session(&path, SourceFormat::Auto).unwrap();
+    let session = load_session(&path, None).unwrap();
     assert_eq!(
         session.metadata.session_id,
         "63679569-7045-45ba-bfef-cad8b1045769"
@@ -148,24 +188,21 @@ fn detects_and_imports_current_claude_fixture() {
             .iter()
             .any(|event| matches!(event, SessionEvent::Reasoning(_)))
     );
-    let message_count = session
-        .events
-        .iter()
-        .filter(|event| matches!(event, SessionEvent::Message(_)))
-        .count();
-    assert_eq!(message_count, 3);
-    assert!(
-        session
-            .events
-            .iter()
-            .any(|event| matches!(event, SessionEvent::ToolCall(_)))
-    );
     assert!(
         session
             .events
             .iter()
             .any(|event| matches!(event, SessionEvent::ToolResult(_)))
     );
+    assert_eq!(
+        session
+            .events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::Message(_)))
+            .count(),
+        3
+    );
+    // `isMeta` entries are injected context, not conversation.
     assert!(!session.events.iter().any(|event| {
         matches!(event, SessionEvent::Message(message) if message.blocks.iter().any(|block| block.text.as_deref().is_some_and(|text| text.contains("Internal command output"))))
     }));
@@ -175,145 +212,58 @@ fn detects_and_imports_current_claude_fixture() {
 fn materializes_canonical_codex_layout() {
     let session = load_session(
         &fixture("claude_current_sample.jsonl"),
-        SourceFormat::Claude,
+        Some(SessionFormat::Claude),
     )
     .unwrap();
     let temp = tempdir().unwrap();
-    let sqlite = temp.path().join("state_5.sqlite");
-    let connection = Connection::open(&sqlite).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                rollout_path TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                model_provider TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                title TEXT NOT NULL,
-                sandbox_policy TEXT NOT NULL,
-                approval_mode TEXT NOT NULL,
-                tokens_used INTEGER NOT NULL DEFAULT 0,
-                has_user_event INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0,
-                archived_at INTEGER,
-                git_sha TEXT,
-                git_branch TEXT,
-                git_origin_url TEXT,
-                cli_version TEXT NOT NULL DEFAULT '',
-                first_user_message TEXT NOT NULL DEFAULT '',
-                agent_nickname TEXT,
-                agent_role TEXT,
-                memory_mode TEXT NOT NULL DEFAULT 'enabled'
-            );",
-        )
-        .unwrap();
+    let connection = state_db(temp.path(), "");
+
     let path = materialize(&session, SessionFormat::Codex, temp.path()).unwrap();
-
-    assert!(path.exists());
     assert!(path.to_string_lossy().contains("/sessions/"));
+    assert!(temp.path().join("session_index.jsonl").exists());
 
-    let index = temp.path().join("session_index.jsonl");
-    assert!(index.exists());
-    let registered_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(registered_count, 1);
     let (id, title, first_user_message): (String, String, String) = connection
         .query_row(
-            "SELECT id, title, first_user_message FROM threads LIMIT 1",
+            "SELECT id, title, first_user_message FROM threads",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(id, session.metadata.session_id);
-    assert_eq!(title, id);
+    assert_eq!(title, "Inspect README.md");
     assert_eq!(first_user_message, "Inspect README.md");
 
-    let text = fs::read_to_string(path).unwrap();
+    let lines = jsonl(&path);
+    let payload = &lines[0]["payload"];
+    assert_eq!(payload["git"]["branch"].as_str(), Some("main"));
+    assert!(payload["cli_version"].as_str().is_some_and(is_semver));
+
+    let text = fs::read_to_string(&path).unwrap();
     assert!(text.contains("\"type\":\"input_image\""));
     assert!(text.contains("\"name\":\"Read\""));
-    let session_meta =
-        serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap()).unwrap();
-    assert_eq!(
-        session_meta
-            .get("payload")
-            .and_then(|payload| payload.get("git"))
-            .and_then(|git| git.get("branch"))
-            .and_then(|value| value.as_str()),
-        Some("main")
-    );
-    let cli_version = serde_json::from_str::<serde_json::Value>(text.lines().next().unwrap())
-        .unwrap()
-        .get("payload")
-        .and_then(|payload| payload.get("cli_version"))
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .unwrap();
-    assert!(
-        is_semver(&cli_version),
-        "unexpected cli_version {cli_version}"
-    );
 }
 
 #[test]
 fn materialized_codex_sessions_include_turn_events() {
+    fn message(role: &str, text: &str) -> SessionEvent {
+        SessionEvent::Message(MessageEvent {
+            id: None,
+            parent_id: None,
+            role: role.to_string(),
+            timestamp: None,
+            blocks: vec![ContentBlock::text("input_text", text)],
+            metadata: Default::default(),
+        })
+    }
+
     let temp = tempdir().unwrap();
-    let sqlite = temp.path().join("state_5.sqlite");
-    let connection = Connection::open(&sqlite).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                rollout_path TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                source TEXT NOT NULL,
-                model_provider TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                title TEXT NOT NULL,
-                sandbox_policy TEXT NOT NULL,
-                approval_mode TEXT NOT NULL,
-                tokens_used INTEGER NOT NULL DEFAULT 0,
-                has_user_event INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0,
-                archived_at INTEGER,
-                git_sha TEXT,
-                git_branch TEXT,
-                git_origin_url TEXT,
-                cli_version TEXT NOT NULL DEFAULT '',
-                first_user_message TEXT NOT NULL DEFAULT '',
-                agent_nickname TEXT,
-                agent_role TEXT,
-                memory_mode TEXT NOT NULL DEFAULT 'enabled',
-                thread_source TEXT,
-                preview TEXT NOT NULL DEFAULT '',
-                history_mode TEXT NOT NULL DEFAULT 'legacy'
-            );",
-        )
-        .unwrap();
+    let connection = state_db(temp.path(), PREVIEW_COLUMNS);
 
     let mut session = UniversalSession::new("turn-events".to_string());
-    session.events.push(SessionEvent::Message(MessageEvent {
-        id: None,
-        parent_id: None,
-        role: "developer".to_string(),
-        timestamp: None,
-        blocks: vec![ContentBlock::text(
-            "input_text",
-            "Repository instructions apply.",
-        )],
-        metadata: Default::default(),
-    }));
-    session.events.push(SessionEvent::Message(MessageEvent {
-        id: None,
-        parent_id: None,
-        role: "user".to_string(),
-        timestamp: None,
-        blocks: vec![ContentBlock::text("input_text", "First prompt")],
-        metadata: Default::default(),
-    }));
+    session
+        .events
+        .push(message("developer", "Repository instructions apply."));
+    session.events.push(message("user", "First prompt"));
     session.events.push(SessionEvent::Reasoning(ReasoningEvent {
         id: None,
         parent_id: None,
@@ -321,90 +271,28 @@ fn materialized_codex_sessions_include_turn_events() {
         summary: vec!["Thinking through the task.".to_string()],
         metadata: Default::default(),
     }));
-    session.events.push(SessionEvent::Message(MessageEvent {
-        id: None,
-        parent_id: None,
-        role: "assistant".to_string(),
-        timestamp: None,
-        blocks: vec![ContentBlock::text(
-            "output_text",
-            "First answer with context.",
-        )],
-        metadata: Default::default(),
-    }));
-    session.events.push(SessionEvent::Message(MessageEvent {
-        id: None,
-        parent_id: None,
-        role: "user".to_string(),
-        timestamp: None,
-        blocks: vec![ContentBlock::text("input_text", "Second prompt")],
-        metadata: Default::default(),
-    }));
-    session.events.push(SessionEvent::Message(MessageEvent {
-        id: None,
-        parent_id: None,
-        role: "assistant".to_string(),
-        timestamp: None,
-        blocks: vec![ContentBlock::text("output_text", "Second answer.")],
-        metadata: Default::default(),
-    }));
+    session
+        .events
+        .push(message("assistant", "First answer with context."));
+    session.events.push(message("user", "Second prompt"));
+    session.events.push(message("assistant", "Second answer."));
 
-    let path = materialize(&session, SessionFormat::Codex, temp.path()).unwrap();
-    let lines = fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
+    let lines = jsonl(&materialize(&session, SessionFormat::Codex, temp.path()).unwrap());
 
-    let type_counts = lines
-        .iter()
-        .filter_map(|value| value.get("type").and_then(|value| value.as_str()))
-        .fold(
-            std::collections::BTreeMap::<String, usize>::new(),
-            |mut acc, value| {
-                *acc.entry(value.to_string()).or_insert(0) += 1;
-                acc
-            },
-        );
-    assert_eq!(type_counts.get("session_meta"), Some(&1));
-    assert_eq!(type_counts.get("turn_context"), None);
-    assert_eq!(type_counts.get("event_msg"), Some(&9));
+    let count = |kind: &str| lines.iter().filter(|line| line["type"] == kind).count();
+    assert_eq!(count("session_meta"), 1);
+    assert_eq!(count("turn_context"), 0);
+    assert_eq!(count("event_msg"), 9);
 
-    let session_meta = lines
-        .iter()
-        .find(|value| value.get("type").and_then(|value| value.as_str()) == Some("session_meta"))
-        .unwrap();
-    assert_eq!(
-        session_meta
-            .get("payload")
-            .and_then(|value| value.get("model_provider"))
-            .and_then(|value| value.as_str()),
-        Some("openai")
-    );
-    assert!(
-        session_meta
-            .get("payload")
-            .and_then(|value| value.get("cli_version"))
-            .and_then(|value| value.as_str())
-            .is_some_and(is_semver)
-    );
-    assert_eq!(
-        session_meta
-            .get("payload")
-            .and_then(|value| value.get("history_mode"))
-            .and_then(|value| value.as_str()),
-        Some("legacy")
-    );
-    assert!(
-        session_meta
-            .get("payload")
-            .and_then(|value| value.get("base_instructions"))
-            .is_none()
-    );
+    let payload = &lines[0]["payload"];
+    assert_eq!(payload["model_provider"].as_str(), Some("openai"));
+    assert_eq!(payload["history_mode"].as_str(), Some("legacy"));
+    assert!(payload["cli_version"].as_str().is_some_and(is_semver));
+    assert!(payload.get("base_instructions").is_none());
 
     let (preview, thread_source, history_mode): (String, String, String) = connection
         .query_row(
-            "SELECT preview, thread_source, history_mode FROM threads LIMIT 1",
+            "SELECT preview, thread_source, history_mode FROM threads",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -413,92 +301,62 @@ fn materialized_codex_sessions_include_turn_events() {
     assert_eq!(thread_source, "user");
     assert_eq!(history_mode, "legacy");
 
-    let event_types = lines
-        .iter()
-        .filter(|value| value.get("type").and_then(|value| value.as_str()) == Some("event_msg"))
-        .filter_map(|value| {
-            value
-                .get("payload")
-                .and_then(|value| value.get("type"))
-                .and_then(|value| value.as_str())
-        })
-        .fold(
-            std::collections::BTreeMap::<String, usize>::new(),
-            |mut acc, value| {
-                *acc.entry(value.to_string()).or_insert(0) += 1;
-                acc
-            },
-        );
-    assert_eq!(event_types.get("task_started"), Some(&2));
-    assert_eq!(event_types.get("user_message"), Some(&2));
-    assert_eq!(event_types.get("agent_reasoning"), Some(&1));
-    assert_eq!(event_types.get("agent_message"), Some(&2));
-    assert_eq!(event_types.get("task_complete"), Some(&2));
+    // The developer message joins the first user turn instead of opening one.
+    let event_count = |kind: &str| {
+        lines
+            .iter()
+            .filter(|line| line["type"] == "event_msg" && line["payload"]["type"] == kind)
+            .count()
+    };
+    assert_eq!(event_count("task_started"), 2);
+    assert_eq!(event_count("user_message"), 2);
+    assert_eq!(event_count("agent_reasoning"), 1);
+    assert_eq!(event_count("agent_message"), 2);
+    assert_eq!(event_count("task_complete"), 2);
 }
 
 #[test]
 fn materializes_canonical_claude_layout() {
-    let session =
-        load_session(&fixture("codex_current_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let session = load_session(
+        &fixture("codex_current_sample.jsonl"),
+        Some(SessionFormat::Codex),
+    )
+    .unwrap();
     let temp = tempdir().unwrap();
     let path = materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
 
-    assert!(path.exists());
     assert!(path.to_string_lossy().contains("/projects/"));
-    let history = temp.path().join("history.jsonl");
-    assert!(history.exists());
-    let text = fs::read_to_string(path).unwrap();
+    assert!(temp.path().join("history.jsonl").exists());
+
     let mut saw_image = false;
     let mut saw_freeform_tool = false;
     let mut saw_structured_tool_result = false;
-    for line in text.lines() {
-        let value: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert!(
-            value
-                .get("version")
-                .and_then(|value| value.as_str())
-                .is_some_and(is_semver)
-        );
-        assert_eq!(
-            value.get("entrypoint").and_then(|value| value.as_str()),
-            Some("cli")
-        );
-        if let Some(message) = value.get("message") {
-            assert!(message.get("content").unwrap().is_array());
-            if value.get("type").and_then(|value| value.as_str()) == Some("assistant") {
-                assert!(message.get("model").is_none());
-            }
-            for block in message
-                .get("content")
-                .and_then(|value| value.as_array())
-                .unwrap()
-            {
-                assert!(!matches!(
-                    block.get("type").and_then(|value| value.as_str()),
-                    Some("input_text" | "output_text")
-                ));
-                match block.get("type").and_then(|value| value.as_str()) {
-                    Some("image") => saw_image = true,
-                    Some("tool_use")
-                        if block.get("name").and_then(|value| value.as_str()) == Some("exec") =>
-                    {
-                        assert!(block.get("input").is_some_and(|value| value.is_object()));
-                        saw_freeform_tool = true;
-                    }
-                    Some("tool_result") => {
-                        let content = block.get("content").unwrap();
-                        if let Some(items) = content.as_array() {
-                            assert!(items.iter().all(|item| {
-                                matches!(
-                                    item.get("type").and_then(|value| value.as_str()),
-                                    Some("text" | "image" | "document")
-                                )
-                            }));
-                            saw_structured_tool_result = true;
-                        }
-                    }
-                    _ => {}
+    for line in jsonl(&path) {
+        assert!(line["version"].as_str().is_some_and(is_semver));
+        assert_eq!(line["entrypoint"].as_str(), Some("cli"));
+        let content = line["message"]["content"].as_array().unwrap();
+
+        for block in content {
+            // Codex block kinds must not leak into a Claude session.
+            assert!(!matches!(
+                block["type"].as_str(),
+                Some("input_text" | "output_text")
+            ));
+            match block["type"].as_str() {
+                Some("image") => saw_image = true,
+                Some("tool_use") if block["name"] == "exec" => {
+                    assert!(block["input"].is_object());
+                    saw_freeform_tool = true;
                 }
+                Some("tool_result") => {
+                    if let Some(items) = block["content"].as_array() {
+                        assert!(items.iter().all(|item| {
+                            matches!(item["type"].as_str(), Some("text" | "image" | "document"))
+                        }));
+                        saw_structured_tool_result = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -509,12 +367,15 @@ fn materializes_canonical_claude_layout() {
 
 #[test]
 fn writes_ir_json() {
-    let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let session = load_session(&fixture("claude_sample.jsonl"), None).unwrap();
     let temp = tempdir().unwrap();
     let output = temp.path().join("session.json");
     let path = materialize(&session, SessionFormat::Ir, &output).unwrap();
-    let text = fs::read_to_string(path).unwrap();
-    assert!(text.contains("\"ir_version\": \"transession/v1\""));
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains("\"ir_version\": \"transession/v1\"")
+    );
 }
 
 #[test]
@@ -523,18 +384,11 @@ fn auto_detects_pretty_printed_ir() {
     let input = temp.path().join("session.json");
     fs::write(
         &input,
-        r#"{
-  "ir_version": "transession/v1",
-  "metadata": {
-    "session_id": "test-session"
-  },
-  "events": []
-}"#,
+        "{\n  \"ir_version\": \"transession/v1\",\n  \"metadata\": { \"session_id\": \"test\" },\n  \"events\": []\n}",
     )
     .unwrap();
 
-    let format = detect_format(&input).unwrap();
-    assert_eq!(format, SessionFormat::Ir);
+    assert_eq!(detect_format(&input).unwrap(), SessionFormat::Ir);
 }
 
 #[test]
@@ -554,142 +408,135 @@ fn projects_codex_developer_messages_into_claude() {
 
     let temp = tempdir().unwrap();
     let path = materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
-    let text = fs::read_to_string(path).unwrap();
-    assert!(text.contains("[transession imported developer message]"));
+    assert!(
+        fs::read_to_string(path)
+            .unwrap()
+            .contains("[transession imported developer message]")
+    );
 }
 
 #[test]
 fn resolves_codex_session_ids_from_default_store_roots() {
-    let session = load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let session = load_session(&fixture("codex_sample.jsonl"), None).unwrap();
     let temp = tempdir().unwrap();
     materialize(&session, SessionFormat::Codex, temp.path()).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("inspect")
-        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
-        .arg("--from")
-        .arg("codex")
-        .arg("--json")
+        .args([
+            "inspect",
+            "019cd6bd-10df-7e61-8506-e9ac5bdf4e6e",
+            "--from",
+            "codex",
+            "--json",
+        ])
         .env("TRANSESSION_CODEX_HOME", temp.path())
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"detected_format\": \"codex\""));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\"detected_format\": \"codex\""));
 }
 
+/// Claude's store root moves between three environment variables; each one has
+/// to resolve a bare session id.
 #[test]
-fn resolves_claude_session_ids_from_default_store_roots() {
-    let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
-    let temp = tempdir().unwrap();
-    materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
+fn resolves_claude_session_ids_from_store_root_variables() {
+    let session = load_session(&fixture("claude_sample.jsonl"), None).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("inspect")
-        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
-        .arg("--from")
-        .arg("claude")
-        .arg("--json")
-        .env("TRANSESSION_CLAUDE_HOME", temp.path())
-        .output()
-        .unwrap();
+    for variable in [
+        "TRANSESSION_CLAUDE_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_HOME",
+    ] {
+        let temp = tempdir().unwrap();
+        materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"detected_format\": \"claude\""));
-}
+        let output = Command::new(env!("CARGO_BIN_EXE_transession"))
+            .args([
+                "inspect",
+                "d89e26cd-11f2-47e8-bea5-a73ad5458483",
+                "--from",
+                "claude",
+                "--json",
+            ])
+            .env_remove("TRANSESSION_CLAUDE_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CLAUDE_HOME")
+            .env(variable, temp.path())
+            .output()
+            .unwrap();
 
-#[test]
-fn resolves_claude_session_ids_from_claude_config_dir_root() {
-    let session = load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
-    let temp = tempdir().unwrap();
-    materialize(&session, SessionFormat::Claude, temp.path()).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("inspect")
-        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
-        .arg("--from")
-        .arg("claude")
-        .arg("--json")
-        .env_remove("TRANSESSION_CLAUDE_HOME")
-        .env_remove("CLAUDE_HOME")
-        .env("CLAUDE_CONFIG_DIR", temp.path())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("\"detected_format\": \"claude\""));
+        assert!(output.status.success(), "{variable}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("\"detected_format\": \"claude\"")
+        );
+    }
 }
 
 #[test]
 fn quick_cli_converts_by_session_id_and_prints_resume_hint() {
-    let source_session =
-        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+    let session = load_session(&fixture("claude_sample.jsonl"), None).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
-    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
+    materialize(&session, SessionFormat::Claude, source_home.path()).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("claude")
-        .arg("--to")
-        .arg("codex")
-        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
-        .arg("--no-open")
+        .args([
+            "--from",
+            "claude",
+            "--to",
+            "codex",
+            "d89e26cd-11f2-47e8-bea5-a73ad5458483",
+            "--no-open",
+        ])
         .env("TRANSESSION_CLAUDE_HOME", source_home.path())
         .env("TRANSESSION_CODEX_HOME", target_home.path())
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(stdout.contains("created codex session:"));
     assert!(stdout.contains("resume with: codex resume "));
 }
 
 #[test]
 fn quick_cli_opens_claude_target_by_default() {
-    let mut source_session =
-        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let mut session = load_session(&fixture("codex_sample.jsonl"), None).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
-    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
-    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+    session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&session, SessionFormat::Codex, source_home.path()).unwrap();
 
-    let log_path = target_home.path().join("launcher.log");
-    let script_path = target_home.path().join("fake-claude.sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CLAUDE_CONFIG_DIR=%s\\n' \"$CLAUDE_CONFIG_DIR\" >> \"{}\"\nprintf 'CLAUDE_HOME=%s\\n' \"$CLAUDE_HOME\" >> \"{}\"\n",
-            log_path.display(),
-            log_path.display(),
-            log_path.display()
+    let log = target_home.path().join("launcher.log");
+    let script = fake_cli(
+        &target_home,
+        "fake-claude.sh",
+        &format!(
+            "printf '%s\\n' \"$@\" > \"{log}\"\n\
+             printf 'CLAUDE_CONFIG_DIR=%s\\nCLAUDE_HOME=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_HOME\" >> \"{log}\"\n",
+            log = log.display()
         ),
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).unwrap();
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("codex")
-        .arg("--to")
-        .arg("claude")
-        .arg("--keep-session-id")
-        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .args([
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--keep-session-id",
+            "019cd6bd-10df-7e61-8506-e9ac5bdf4e6e",
+        ])
         .arg("--output")
         .arg(target_home.path())
         .env("TRANSESSION_CODEX_HOME", source_home.path())
-        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .env("TRANSESSION_CLAUDE_BIN", &script)
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let log = fs::read_to_string(log_path).unwrap();
+    let log = fs::read_to_string(log).unwrap();
     assert!(log.contains("-r"));
     assert!(log.contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"));
     assert!(log.contains(&format!(
@@ -699,62 +546,59 @@ fn quick_cli_opens_claude_target_by_default() {
     assert!(log.contains(&format!("CLAUDE_HOME={}", target_home.path().display())));
 }
 
+/// Claude Code keeps its account record in `<CLAUDE_CONFIG_DIR>/.claude.json`,
+/// so overriding the variable with the store we just wrote into would send the
+/// user through login again.
 #[test]
 fn quick_cli_opens_claude_in_installed_home_without_config_override() {
-    let mut source_session =
-        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+    let mut session = load_session(&fixture("codex_sample.jsonl"), None).unwrap();
     let source_home = tempdir().unwrap();
     let claude_home = tempdir().unwrap();
-    source_session.metadata.cwd = Some(claude_home.path().join("missing-session-cwd"));
-    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+    session.metadata.cwd = Some(claude_home.path().join("missing-session-cwd"));
+    materialize(&session, SessionFormat::Codex, source_home.path()).unwrap();
 
-    let log_path = claude_home.path().join("launcher.log");
-    let script_path = claude_home.path().join("fake-claude.sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\nprintf 'CLAUDE_CONFIG_DIR=%s\\n' \"$CLAUDE_CONFIG_DIR\" > \"{}\"\nprintf 'CLAUDE_HOME=%s\\n' \"$CLAUDE_HOME\" >> \"{}\"\n",
-            log_path.display(),
-            log_path.display()
+    let log = claude_home.path().join("launcher.log");
+    let script = fake_cli(
+        &claude_home,
+        "fake-claude.sh",
+        &format!(
+            "printf 'CLAUDE_CONFIG_DIR=%s\\nCLAUDE_HOME=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_HOME\" > \"{}\"\n",
+            log.display()
         ),
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).unwrap();
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("codex")
-        .arg("--to")
-        .arg("claude")
-        .arg("--keep-session-id")
-        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .args([
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--keep-session-id",
+            "019cd6bd-10df-7e61-8506-e9ac5bdf4e6e",
+        ])
         .arg("--output")
         .arg(claude_home.path())
         .env("TRANSESSION_CODEX_HOME", source_home.path())
         .env("TRANSESSION_CLAUDE_HOME", claude_home.path())
-        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .env("TRANSESSION_CLAUDE_BIN", &script)
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    // Claude Code keeps its account record in `<CLAUDE_CONFIG_DIR>/.claude.json`,
-    // so overriding the variable with the store we just wrote into would send
-    // the user through login again.
-    let log = fs::read_to_string(log_path).unwrap();
-    assert_eq!(log, "CLAUDE_CONFIG_DIR=\nCLAUDE_HOME=\n");
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "CLAUDE_CONFIG_DIR=\nCLAUDE_HOME=\n"
+    );
 }
 
 #[test]
-fn quick_cli_opens_claude_target_bootstraps_login_state() {
-    let mut source_session =
-        load_session(&fixture("codex_sample.jsonl"), SourceFormat::Codex).unwrap();
+fn quick_cli_links_claude_login_state_into_a_custom_home() {
+    let mut session = load_session(&fixture("codex_sample.jsonl"), None).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
     let installed_home = tempdir().unwrap();
-    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
-    materialize(&source_session, SessionFormat::Codex, source_home.path()).unwrap();
+    session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&session, SessionFormat::Codex, source_home.path()).unwrap();
     fs::write(
         installed_home.path().join(".credentials.json"),
         "{\"claudeAiOauth\":{}}",
@@ -766,130 +610,90 @@ fn quick_cli_opens_claude_target_bootstraps_login_state() {
     )
     .unwrap();
 
-    let log_path = target_home.path().join("launcher.log");
-    let script_path = target_home.path().join("fake-claude.sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\nfor file in .credentials.json .claude.json; do\n  if [ ! -e \"$CLAUDE_CONFIG_DIR/$file\" ]; then\n    echo \"missing $file\" >&2\n    exit 1\n  fi\ndone\nprintf '%s\\n' \"$@\" > \"{}\"\n",
-            log_path.display()
+    let log = target_home.path().join("launcher.log");
+    let script = fake_cli(
+        &target_home,
+        "fake-claude.sh",
+        &format!(
+            "for file in .credentials.json .claude.json; do\n\
+               [ -e \"$CLAUDE_CONFIG_DIR/$file\" ] || {{ echo \"missing $file\" >&2; exit 1; }}\n\
+             done\n\
+             printf '%s\\n' \"$@\" > \"{}\"\n",
+            log.display()
         ),
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).unwrap();
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("codex")
-        .arg("--to")
-        .arg("claude")
-        .arg("--keep-session-id")
-        .arg("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+        .args([
+            "--from",
+            "codex",
+            "--to",
+            "claude",
+            "--keep-session-id",
+            "019cd6bd-10df-7e61-8506-e9ac5bdf4e6e",
+        ])
         .arg("--output")
         .arg(target_home.path())
         .env("TRANSESSION_CODEX_HOME", source_home.path())
         .env("TRANSESSION_CLAUDE_HOME", installed_home.path())
-        .env("TRANSESSION_CLAUDE_BIN", &script_path)
+        .env("TRANSESSION_CLAUDE_BIN", &script)
         .output()
         .unwrap();
 
     assert!(output.status.success(), "{output:?}");
-    let log = fs::read_to_string(log_path).unwrap();
-    assert!(log.contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e"));
+    assert!(
+        fs::read_to_string(log)
+            .unwrap()
+            .contains("019cd6bd-10df-7e61-8506-e9ac5bdf4e6e")
+    );
 }
 
 #[test]
-fn quick_cli_opens_codex_target_by_default_bootstraps_auth() {
-    let mut source_session =
-        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
+fn quick_cli_links_codex_auth_into_a_custom_home() {
+    let mut session = load_session(&fixture("claude_sample.jsonl"), None).unwrap();
     let source_home = tempdir().unwrap();
     let target_home = tempdir().unwrap();
     let installed_home = tempdir().unwrap();
-    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
-    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
+    session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
+    materialize(&session, SessionFormat::Claude, source_home.path()).unwrap();
     fs::write(
         installed_home.path().join("auth.json"),
         "{\"access_token\":\"test\"}",
     )
     .unwrap();
 
-    let log_path = target_home.path().join("launcher.log");
-    let script_path = target_home.path().join("fake-codex.sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\nif [ ! -e \"$CODEX_HOME/auth.json\" ]; then\n  echo 'missing auth' >&2\n  exit 1\nfi\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CODEX_HOME=%s\\n' \"$CODEX_HOME\" >> \"{}\"\n",
-            log_path.display(),
-            log_path.display()
+    let log = target_home.path().join("launcher.log");
+    let script = fake_cli(
+        &target_home,
+        "fake-codex.sh",
+        &format!(
+            "[ -e \"$CODEX_HOME/auth.json\" ] || {{ echo 'missing auth' >&2; exit 1; }}\n\
+             printf '%s\\n' \"$@\" > \"{log}\"\n\
+             printf 'CODEX_HOME=%s\\n' \"$CODEX_HOME\" >> \"{log}\"\n",
+            log = log.display()
         ),
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).unwrap();
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("claude")
-        .arg("--to")
-        .arg("codex")
-        .arg("--keep-session-id")
-        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
+        .args([
+            "--from",
+            "claude",
+            "--to",
+            "codex",
+            "--keep-session-id",
+            "d89e26cd-11f2-47e8-bea5-a73ad5458483",
+        ])
         .arg("--output")
         .arg(target_home.path())
         .env("TRANSESSION_CLAUDE_HOME", source_home.path())
         .env("CODEX_HOME", installed_home.path())
-        .env("TRANSESSION_CODEX_BIN", &script_path)
+        .env("TRANSESSION_CODEX_BIN", &script)
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let log = fs::read_to_string(log_path).unwrap();
+    let log = fs::read_to_string(log).unwrap();
     assert!(log.contains("resume"));
     assert!(log.contains("d89e26cd-11f2-47e8-bea5-a73ad5458483"));
-}
-
-#[test]
-fn quick_cli_opens_target_agent_by_default() {
-    let mut source_session =
-        load_session(&fixture("claude_sample.jsonl"), SourceFormat::Claude).unwrap();
-    let source_home = tempdir().unwrap();
-    let target_home = tempdir().unwrap();
-    source_session.metadata.cwd = Some(target_home.path().join("missing-session-cwd"));
-    materialize(&source_session, SessionFormat::Claude, source_home.path()).unwrap();
-
-    let log_path = target_home.path().join("launcher.log");
-    let script_path = target_home.path().join("fake-codex.sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'CODEX_HOME=%s\\n' \"$CODEX_HOME\" >> \"{}\"\n",
-            log_path.display(),
-            log_path.display()
-        ),
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script_path, permissions).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_transession"))
-        .arg("--from")
-        .arg("claude")
-        .arg("--to")
-        .arg("codex")
-        .arg("d89e26cd-11f2-47e8-bea5-a73ad5458483")
-        .arg("--output")
-        .arg(target_home.path())
-        .env("TRANSESSION_CLAUDE_HOME", source_home.path())
-        .env("TRANSESSION_CODEX_BIN", &script_path)
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let log = fs::read_to_string(log_path).unwrap();
-    assert!(log.contains("resume"));
-    assert!(log.contains("CODEX_HOME="));
+    assert!(log.contains(&format!("CODEX_HOME={}", target_home.path().display())));
 }
