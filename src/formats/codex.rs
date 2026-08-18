@@ -230,22 +230,65 @@ fn import_response_item(
             }))
         }
         "function_call_output" | "custom_tool_call_output" => {
+            let output = payload.get("output");
             events.push(SessionEvent::ToolResult(ToolResultEvent {
                 id,
                 parent_id: None,
                 call_id: string_field(payload, "call_id"),
                 timestamp,
-                output: payload
-                    .get("output")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new())),
-                // TODO: Codex encodes failures inside the output payload; we do
-                // not currently parse them out into `is_error`.
-                is_error: false,
+                is_error: output.is_some_and(output_is_error),
+                output: output.cloned().unwrap_or(Value::String(String::new())),
                 metadata: BTreeMap::new(),
             }))
         }
         _ => {}
+    }
+}
+
+// ==============================================================================
+// Failure Detection
+// ==============================================================================
+
+// Codex has no `is_error` flag on a tool result: its shell tools state the
+// outcome in the first line of their own output, and the structured envelope
+// carries the process exit code. Claude does have the flag and renders failed
+// results differently, so it is worth recovering.
+//
+// ponytail: only these three conventions are recognised. Free-form failures
+// ("apply_patch verification failed: ...", "collab spawn failed: ...") are left
+// as successes rather than growing a list of prose prefixes to match.
+
+/// Codex output is either a plain string, or a list of content blocks whose
+/// first text block holds the status line.
+fn output_is_error(output: &Value) -> bool {
+    match output {
+        Value::String(text) => text_reports_failure(text),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| item.get("text").and_then(Value::as_str))
+            .is_some_and(text_reports_failure),
+        _ => false,
+    }
+}
+
+fn text_reports_failure(text: &str) -> bool {
+    // Some tools wrap their result as `{"metadata": {"exit_code": N, ...}, ...}`,
+    // which states the outcome outright.
+    if let Ok(value) = serde_json::from_str::<Value>(text)
+        && let Some(exit_code) = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("exit_code"))
+            .and_then(Value::as_i64)
+    {
+        return exit_code != 0;
+    }
+
+    // Otherwise the first line is `Exit code: N` or `Script completed`/
+    // `Script failed`, depending on which shell tool ran.
+    let first_line = text.lines().next().unwrap_or_default().trim();
+    match first_line.strip_prefix("Exit code:") {
+        Some(code) => code.trim().parse::<i64>().is_ok_and(|code| code != 0),
+        None => first_line == "Script failed",
     }
 }
 
@@ -795,4 +838,43 @@ fn register_thread_in_sqlite(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_is_error;
+    use serde_json::json;
+
+    #[test]
+    fn reads_failure_out_of_codex_tool_output() {
+        // `Exit code: N` from the shell tool.
+        assert!(!output_is_error(&json!(
+            "Exit code: 0\nWall time: 0.1 seconds"
+        )));
+        assert!(output_is_error(&json!(
+            "Exit code: 127\nWall time: 0.1 seconds"
+        )));
+
+        // `Script completed` / `Script failed` from the freeform exec tool.
+        let block = |text| json!([{ "type": "input_text", "text": text }]);
+        assert!(!output_is_error(&block(
+            "Script completed\nWall time 0.0 seconds"
+        )));
+        assert!(output_is_error(&block(
+            "Script failed\nWall time 0.0 seconds"
+        )));
+
+        // The structured envelope states the exit code outright.
+        assert!(!output_is_error(&json!(
+            r#"{"metadata":{"exit_code":0,"duration_seconds":0.0},"output":"done"}"#
+        )));
+        assert!(output_is_error(&json!(
+            r#"{"metadata":{"exit_code":2,"duration_seconds":0.0},"output":"nope"}"#
+        )));
+
+        // Output with no status line of its own is not a failure.
+        assert!(!output_is_error(&block("README.md contents")));
+        assert!(!output_is_error(&json!("Plan updated")));
+        assert!(!output_is_error(&json!({ "unexpected": true })));
+    }
 }

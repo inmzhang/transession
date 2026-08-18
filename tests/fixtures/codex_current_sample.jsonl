@@ -9,5 +9,7 @@
 {"timestamp": "2026-07-20T02:05:08.000Z", "ordinal": 8, "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "I will inspect it."}], "phase": "commentary"}}
 {"timestamp": "2026-07-20T02:05:09.000Z", "ordinal": 9, "type": "response_item", "payload": {"type": "custom_tool_call", "id": "ctc_123", "status": "completed", "call_id": "call_123", "name": "exec", "input": "const result = await tools.read_file({ path: \"README.md\" });"}}
 {"timestamp": "2026-07-20T02:05:10.000Z", "ordinal": 10, "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "call_123", "output": [{"type": "input_text", "text": "README.md contents"}]}}
+{"timestamp": "2026-07-20T02:05:11.000Z", "ordinal": 11, "type": "response_item", "payload": {"type": "function_call", "id": "fc_124", "call_id": "call_124", "name": "shell", "arguments": "{\"command\": [\"bash\", \"-lc\", \"missing-command\"]}"}}
+{"timestamp": "2026-07-20T02:05:12.000Z", "ordinal": 12, "type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_124", "output": "Exit code: 127\nWall time: 0.0 seconds\nOutput:\nmissing-command: command not found\n"}}
 {"timestamp": "2026-07-20T02:05:11.000Z", "ordinal": 11, "type": "world_state", "payload": {"full": true, "state": {}}}
 {"timestamp": "2026-07-20T02:05:12.000Z", "ordinal": 12, "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "019f7d47-b664-7ab1-965a-1e3077bb0807", "last_agent_message": "I will inspect it."}}

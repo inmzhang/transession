@@ -134,16 +134,21 @@ fn detects_and_imports_current_codex_fixture() {
             .iter()
             .any(|event| matches!(event, SessionEvent::Reasoning(_)))
     );
-    assert!(
-        session
-            .events
-            .iter()
-            .any(|event| matches!(event, SessionEvent::ToolResult(_)))
-    );
     // Freeform tools spell their payload as a plain (non-JSON) string.
     assert!(session.events.iter().any(|event| {
         matches!(event, SessionEvent::ToolCall(call) if call.name == "exec" && call.arguments.is_string())
     }));
+    // Codex states failure in the output text rather than a flag; the fixture
+    // holds one successful result and one `Exit code: 127`.
+    let failures: Vec<bool> = session
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::ToolResult(result) => Some(result.is_error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures, [false, true]);
 }
 
 #[test]
@@ -331,6 +336,7 @@ fn materializes_canonical_claude_layout() {
     let mut saw_image = false;
     let mut saw_freeform_tool = false;
     let mut saw_structured_tool_result = false;
+    let mut saw_failed_tool_result = false;
     for line in jsonl(&path) {
         assert!(line["version"].as_str().is_some_and(is_semver));
         assert_eq!(line["entrypoint"].as_str(), Some("cli"));
@@ -349,6 +355,9 @@ fn materializes_canonical_claude_layout() {
                     saw_freeform_tool = true;
                 }
                 Some("tool_result") => {
+                    if block["is_error"] == true {
+                        saw_failed_tool_result = true;
+                    }
                     if let Some(items) = block["content"].as_array() {
                         assert!(items.iter().all(|item| {
                             matches!(item["type"].as_str(), Some("text" | "image" | "document"))
@@ -363,6 +372,7 @@ fn materializes_canonical_claude_layout() {
     assert!(saw_image);
     assert!(saw_freeform_tool);
     assert!(saw_structured_tool_result);
+    assert!(saw_failed_tool_result);
 }
 
 #[test]
